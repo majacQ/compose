@@ -1,10 +1,8 @@
-from __future__ import absolute_import
-from __future__ import unicode_literals
-
 import docker
 
 from .. import mock
 from .. import unittest
+from ..helpers import BUSYBOX_IMAGE_WITH_TAG
 from compose.const import LABEL_ONE_OFF
 from compose.const import LABEL_SLUG
 from compose.container import Container
@@ -17,7 +15,7 @@ class ContainerTest(unittest.TestCase):
         self.container_id = "abcabcabcbabc12345"
         self.container_dict = {
             "Id": self.container_id,
-            "Image": "busybox:latest",
+            "Image": BUSYBOX_IMAGE_WITH_TAG,
             "Command": "top",
             "Created": 1387384730,
             "Status": "Up 8 seconds",
@@ -43,7 +41,7 @@ class ContainerTest(unittest.TestCase):
                                       has_been_inspected=True)
         assert container.dictionary == {
             "Id": self.container_id,
-            "Image": "busybox:latest",
+            "Image": BUSYBOX_IMAGE_WITH_TAG,
             "Name": "/composetest_db_1",
         }
 
@@ -58,7 +56,7 @@ class ContainerTest(unittest.TestCase):
             has_been_inspected=True)
         assert container.dictionary == {
             "Id": self.container_id,
-            "Image": "busybox:latest",
+            "Image": BUSYBOX_IMAGE_WITH_TAG,
             "Name": "/composetest_db_1",
         }
 
@@ -222,34 +220,6 @@ class ContainerTest(unittest.TestCase):
     def test_short_id(self):
         container = Container(None, self.container_dict, has_been_inspected=True)
         assert container.short_id == self.container_id[:12]
-
-    def test_has_api_logs(self):
-        container_dict = {
-            'HostConfig': {
-                'LogConfig': {
-                    'Type': 'json-file'
-                }
-            }
-        }
-
-        container = Container(None, container_dict, has_been_inspected=True)
-        assert container.has_api_logs is True
-
-        container_dict['HostConfig']['LogConfig']['Type'] = 'none'
-        container = Container(None, container_dict, has_been_inspected=True)
-        assert container.has_api_logs is False
-
-        container_dict['HostConfig']['LogConfig']['Type'] = 'syslog'
-        container = Container(None, container_dict, has_been_inspected=True)
-        assert container.has_api_logs is False
-
-        container_dict['HostConfig']['LogConfig']['Type'] = 'journald'
-        container = Container(None, container_dict, has_been_inspected=True)
-        assert container.has_api_logs is True
-
-        container_dict['HostConfig']['LogConfig']['Type'] = 'foobar'
-        container = Container(None, container_dict, has_been_inspected=True)
-        assert container.has_api_logs is False
 
 
 class GetContainerNameTestCase(unittest.TestCase):

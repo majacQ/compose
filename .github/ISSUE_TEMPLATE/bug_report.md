@@ -1,6 +1,9 @@
 ---
 name: Bug report
 about: Report a bug encountered while using docker-compose
+title: ''
+labels: kind/bug
+assignees: ''
 
 ---
 
@@ -22,7 +25,10 @@ Welcome to the docker-compose issue tracker! Before creating an issue, please he
 
 ## Context information (for bug reports)
 
-**Output of `docker-compose version`**
+- [ ] Using Compose V2 `docker compose ...`
+- [ ] Using Compose V1 `docker-compose ...`
+
+**Output of `docker(-)compose version`**
 ```
 (paste here)
 ```

@@ -1,11 +1,13 @@
-from __future__ import absolute_import
-from __future__ import unicode_literals
-
+import contextlib
 import os
 
 from compose.config.config import ConfigDetails
 from compose.config.config import ConfigFile
 from compose.config.config import load
+
+BUSYBOX_IMAGE_NAME = 'busybox'
+BUSYBOX_DEFAULT_TAG = '1.31.0-uclibc'
+BUSYBOX_IMAGE_WITH_TAG = '{}:{}'.format(BUSYBOX_IMAGE_NAME, BUSYBOX_DEFAULT_TAG)
 
 
 def build_config(contents, **kwargs):
@@ -22,7 +24,7 @@ def build_config_details(contents, working_dir='working_dir', filename='filename
 def create_custom_host_file(client, filename, content):
     dirname = os.path.dirname(filename)
     container = client.create_container(
-        'busybox:latest',
+        BUSYBOX_IMAGE_WITH_TAG,
         ['sh', '-c', 'echo -n "{}" > {}'.format(content, filename)],
         volumes={dirname: {}},
         host_config=client.create_host_config(
@@ -47,7 +49,21 @@ def create_custom_host_file(client, filename, content):
 
 
 def create_host_file(client, filename):
-    with open(filename, 'r') as fh:
+    with open(filename) as fh:
         content = fh.read()
 
     return create_custom_host_file(client, filename, content)
+
+
+@contextlib.contextmanager
+def cd(path):
+    """
+    A context manager which changes the working directory to the given
+    path, and then changes it back to its previous value on exit.
+    """
+    prev_cwd = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(prev_cwd)

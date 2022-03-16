@@ -1,7 +1,3 @@
-# -*- coding: utf-8 -*-
-from __future__ import absolute_import
-from __future__ import unicode_literals
-
 import datetime
 import json
 import os.path
@@ -11,17 +7,20 @@ import subprocess
 import time
 from collections import Counter
 from collections import namedtuple
+from functools import reduce
 from operator import attrgetter
 
 import pytest
-import six
 import yaml
 from docker import errors
 
 from .. import mock
+from ..helpers import BUSYBOX_IMAGE_WITH_TAG
 from ..helpers import create_host_file
 from compose.cli.command import get_project
 from compose.config.errors import DuplicateOverrideFileFound
+from compose.const import COMPOSE_SPEC as VERSION
+from compose.const import COMPOSEFILE_V1 as V1
 from compose.container import Container
 from compose.project import OneOffFilter
 from compose.utils import nanoseconds_from_time_seconds
@@ -31,35 +30,62 @@ from tests.integration.testcases import is_cluster
 from tests.integration.testcases import no_cluster
 from tests.integration.testcases import pull_busybox
 from tests.integration.testcases import SWARM_SKIP_RM_VOLUMES
-from tests.integration.testcases import v2_1_only
-from tests.integration.testcases import v2_2_only
-from tests.integration.testcases import v2_only
-from tests.integration.testcases import v3_only
+
+DOCKER_COMPOSE_EXECUTABLE = 'docker-compose'
 
 ProcessResult = namedtuple('ProcessResult', 'stdout stderr')
 
 
 BUILD_CACHE_TEXT = 'Using cache'
-BUILD_PULL_TEXT = 'Status: Image is up to date for busybox:latest'
+BUILD_PULL_TEXT = 'Status: Image is up to date for busybox:1.27.2'
+COMPOSE_COMPATIBILITY_DICT = {
+    'version': str(VERSION),
+    'volumes': {'foo': {'driver': 'default'}},
+    'networks': {'bar': {}},
+    'services': {
+        'foo': {
+            'command': '/bin/true',
+            'image': 'alpine:3.10.1',
+            'scale': 3,
+            'restart': 'always:7',
+            'mem_limit': '300M',
+            'mem_reservation': '100M',
+            'cpus': 0.7,
+            'volumes': ['foo:/bar:rw'],
+            'networks': {'bar': None},
+        }
+    },
+}
 
 
-def start_process(base_dir, options):
+def start_process(base_dir, options, executable=None, env=None):
+    executable = executable or DOCKER_COMPOSE_EXECUTABLE
     proc = subprocess.Popen(
-        ['docker-compose'] + options,
+        [executable] + options,
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        cwd=base_dir)
+        cwd=base_dir,
+        env=env,
+    )
     print("Running process: %s" % proc.pid)
     return proc
 
 
-def wait_on_process(proc, returncode=0):
-    stdout, stderr = proc.communicate()
+def wait_on_process(proc, returncode=0, stdin=None):
+    stdout, stderr = proc.communicate(input=stdin)
     if proc.returncode != returncode:
         print("Stderr: {}".format(stderr))
         print("Stdout: {}".format(stdout))
         assert proc.returncode == returncode
     return ProcessResult(stdout.decode('utf-8'), stderr.decode('utf-8'))
+
+
+def dispatch(base_dir, options,
+             project_options=None, returncode=0, stdin=None, executable=None, env=None):
+    project_options = project_options or []
+    proc = start_process(base_dir, project_options + options, executable=executable, env=env)
+    return wait_on_process(proc, returncode=returncode, stdin=stdin)
 
 
 def wait_on_condition(condition, delay=0.1, timeout=40):
@@ -76,7 +102,7 @@ def kill_service(service):
             container.kill()
 
 
-class ContainerCountCondition(object):
+class ContainerCountCondition:
 
     def __init__(self, project, expected):
         self.project = project
@@ -89,7 +115,7 @@ class ContainerCountCondition(object):
         return "waiting for counter count == %s" % self.expected
 
 
-class ContainerStateCondition(object):
+class ContainerStateCondition:
 
     def __init__(self, client, name, status):
         self.client = client
@@ -117,7 +143,7 @@ class ContainerStateCondition(object):
 class CLITestCase(DockerClientTestCase):
 
     def setUp(self):
-        super(CLITestCase, self).setUp()
+        super().setUp()
         self.base_dir = 'tests/fixtures/simple-composefile'
         self.override_dir = None
 
@@ -139,7 +165,7 @@ class CLITestCase(DockerClientTestCase):
         if hasattr(self, '_project'):
             del self._project
 
-        super(CLITestCase, self).tearDown()
+        super().tearDown()
 
     @property
     def project(self):
@@ -148,10 +174,8 @@ class CLITestCase(DockerClientTestCase):
             self._project = get_project(self.base_dir, override_dir=self.override_dir)
         return self._project
 
-    def dispatch(self, options, project_options=None, returncode=0):
-        project_options = project_options or []
-        proc = start_process(self.base_dir, project_options + options)
-        return wait_on_process(proc, returncode=returncode)
+    def dispatch(self, options, project_options=None, returncode=0, stdin=None):
+        return dispatch(self.base_dir, options, project_options, returncode, stdin)
 
     def execute(self, container, cmd):
         # Remove once Hijack and CloseNotifier sign a peace treaty
@@ -166,9 +190,16 @@ class CLITestCase(DockerClientTestCase):
     def test_help(self):
         self.base_dir = 'tests/fixtures/no-composefile'
         result = self.dispatch(['help', 'up'], returncode=0)
-        assert 'Usage: up [options] [--scale SERVICE=NUM...] [SERVICE...]' in result.stdout
+        assert 'Usage: up [options] [--scale SERVICE=NUM...] [--] [SERVICE...]' in result.stdout
         # Prevent tearDown from trying to create a project
         self.base_dir = None
+
+    def test_quiet_build(self):
+        self.base_dir = 'tests/fixtures/build-args'
+        result = self.dispatch(['build'], None)
+        quietResult = self.dispatch(['build', '-q'], None)
+        assert result.stdout != ""
+        assert quietResult.stdout == ""
 
     def test_help_nonexistent(self):
         self.base_dir = 'tests/fixtures/no-composefile'
@@ -178,14 +209,14 @@ class CLITestCase(DockerClientTestCase):
 
     def test_shorthand_host_opt(self):
         self.dispatch(
-            ['-H={0}'.format(os.environ.get('DOCKER_HOST', 'unix://')),
+            ['-H={}'.format(os.environ.get('DOCKER_HOST', 'unix://')),
              'up', '-d'],
             returncode=0
         )
 
     def test_shorthand_host_opt_interactive(self):
         self.dispatch(
-            ['-H={0}'.format(os.environ.get('DOCKER_HOST', 'unix://')),
+            ['-H={}'.format(os.environ.get('DOCKER_HOST', 'unix://')),
              'run', 'another', 'ls'],
             returncode=0
         )
@@ -205,6 +236,11 @@ class CLITestCase(DockerClientTestCase):
 
         result = self.dispatch(['-H=tcp://doesnotexist:8000', 'ps'], returncode=1)
         assert "Couldn't connect to Docker daemon" in result.stderr
+
+    def test_config_list_profiles(self):
+        self.base_dir = 'tests/fixtures/config-profiles'
+        result = self.dispatch(['config', '--profiles'])
+        assert set(result.stdout.rstrip().split('\n')) == {'debug', 'frontend', 'gui'}
 
     def test_config_list_services(self):
         self.base_dir = 'tests/fixtures/v2-full'
@@ -228,6 +264,17 @@ class CLITestCase(DockerClientTestCase):
         self.base_dir = 'tests/fixtures/v2-full'
         assert self.dispatch(['config', '--quiet']).stdout == ''
 
+    def test_config_stdin(self):
+        config = b"""version: "3.7"
+services:
+  web:
+    image: nginx
+  other:
+    image: alpine
+"""
+        result = self.dispatch(['-f', '-', 'config', '--services'], stdin=config)
+        assert set(result.stdout.rstrip().split('\n')) == {'web', 'other'}
+
     def test_config_with_hash_option(self):
         self.base_dir = 'tests/fixtures/v2-full'
         result = self.dispatch(['config', '--hash=*'])
@@ -244,9 +291,9 @@ class CLITestCase(DockerClientTestCase):
         # assert there are no python objects encoded in the output
         assert '!!' not in result.stdout
 
-        output = yaml.load(result.stdout)
+        output = yaml.safe_load(result.stdout)
         expected = {
-            'version': '2.0',
+            'version': '2',
             'volumes': {'data': {'driver': 'local'}},
             'networks': {'front': {}},
             'services': {
@@ -258,7 +305,7 @@ class CLITestCase(DockerClientTestCase):
                     'volumes_from': ['service:other:rw'],
                 },
                 'other': {
-                    'image': 'busybox:latest',
+                    'image': BUSYBOX_IMAGE_WITH_TAG,
                     'command': 'top',
                     'volumes': ['/data'],
                 },
@@ -269,8 +316,8 @@ class CLITestCase(DockerClientTestCase):
     def test_config_restart(self):
         self.base_dir = 'tests/fixtures/restart'
         result = self.dispatch(['config'])
-        assert yaml.load(result.stdout) == {
-            'version': '2.0',
+        assert yaml.safe_load(result.stdout) == {
+            'version': '2',
             'services': {
                 'never': {
                     'image': 'busybox',
@@ -298,67 +345,84 @@ class CLITestCase(DockerClientTestCase):
     def test_config_external_network(self):
         self.base_dir = 'tests/fixtures/networks'
         result = self.dispatch(['-f', 'external-networks.yml', 'config'])
-        json_result = yaml.load(result.stdout)
+        json_result = yaml.safe_load(result.stdout)
         assert 'networks' in json_result
         assert json_result['networks'] == {
             'networks_foo': {
-                'external': True  # {'name': 'networks_foo'}
+                'external': True,
+                'name': 'networks_foo'
             },
             'bar': {
-                'external': {'name': 'networks_bar'}
+                'external': True,
+                'name': 'networks_bar'
             }
         }
 
     def test_config_with_dot_env(self):
         self.base_dir = 'tests/fixtures/default-env-file'
         result = self.dispatch(['config'])
-        json_result = yaml.load(result.stdout)
+        json_result = yaml.safe_load(result.stdout)
         assert json_result == {
+            'version': '2.4',
             'services': {
                 'web': {
                     'command': 'true',
                     'image': 'alpine:latest',
-                    'ports': ['5643/tcp', '9999/tcp']
+                    'ports': [{'target': 5643}, {'target': 9999}]
                 }
-            },
-            'version': '2.4'
+            }
+        }
+
+    def test_config_with_env_file(self):
+        self.base_dir = 'tests/fixtures/default-env-file'
+        result = self.dispatch(['--env-file', '.env2', 'config'])
+        json_result = yaml.safe_load(result.stdout)
+        assert json_result == {
+            'version': '2.4',
+            'services': {
+                'web': {
+                    'command': 'false',
+                    'image': 'alpine:latest',
+                    'ports': [{'target': 5644}, {'target': 9998}]
+                }
+            }
         }
 
     def test_config_with_dot_env_and_override_dir(self):
         self.base_dir = 'tests/fixtures/default-env-file'
         result = self.dispatch(['--project-directory', 'alt/', 'config'])
-        json_result = yaml.load(result.stdout)
+        json_result = yaml.safe_load(result.stdout)
         assert json_result == {
+            'version': '2.4',
             'services': {
                 'web': {
                     'command': 'echo uwu',
-                    'image': 'alpine:3.4',
-                    'ports': ['3341/tcp', '4449/tcp']
+                    'image': 'alpine:3.10.1',
+                    'ports': [{'target': 3341}, {'target': 4449}]
                 }
-            },
-            'version': '2.4'
+            }
         }
 
     def test_config_external_volume_v2(self):
         self.base_dir = 'tests/fixtures/volumes'
         result = self.dispatch(['-f', 'external-volumes-v2.yml', 'config'])
-        json_result = yaml.load(result.stdout)
+        json_result = yaml.safe_load(result.stdout)
         assert 'volumes' in json_result
         assert json_result['volumes'] == {
             'foo': {
                 'external': True,
+                'name': 'foo',
             },
             'bar': {
-                'external': {
-                    'name': 'some_bar',
-                },
+                'external': True,
+                'name': 'some_bar',
             }
         }
 
     def test_config_external_volume_v2_x(self):
         self.base_dir = 'tests/fixtures/volumes'
         result = self.dispatch(['-f', 'external-volumes-v2-x.yml', 'config'])
-        json_result = yaml.load(result.stdout)
+        json_result = yaml.safe_load(result.stdout)
         assert 'volumes' in json_result
         assert json_result['volumes'] == {
             'foo': {
@@ -374,23 +438,23 @@ class CLITestCase(DockerClientTestCase):
     def test_config_external_volume_v3_x(self):
         self.base_dir = 'tests/fixtures/volumes'
         result = self.dispatch(['-f', 'external-volumes-v3-x.yml', 'config'])
-        json_result = yaml.load(result.stdout)
+        json_result = yaml.safe_load(result.stdout)
         assert 'volumes' in json_result
         assert json_result['volumes'] == {
             'foo': {
                 'external': True,
+                'name': 'foo',
             },
             'bar': {
-                'external': {
-                    'name': 'some_bar',
-                },
+                'external': True,
+                'name': 'some_bar',
             }
         }
 
     def test_config_external_volume_v3_4(self):
         self.base_dir = 'tests/fixtures/volumes'
         result = self.dispatch(['-f', 'external-volumes-v3-4.yml', 'config'])
-        json_result = yaml.load(result.stdout)
+        json_result = yaml.safe_load(result.stdout)
         assert 'volumes' in json_result
         assert json_result['volumes'] == {
             'foo': {
@@ -406,7 +470,7 @@ class CLITestCase(DockerClientTestCase):
     def test_config_external_network_v3_5(self):
         self.base_dir = 'tests/fixtures/networks'
         result = self.dispatch(['-f', 'external-networks-v3-5.yml', 'config'])
-        json_result = yaml.load(result.stdout)
+        json_result = yaml.safe_load(result.stdout)
         assert 'networks' in json_result
         assert json_result['networks'] == {
             'foo': {
@@ -422,8 +486,8 @@ class CLITestCase(DockerClientTestCase):
     def test_config_v1(self):
         self.base_dir = 'tests/fixtures/v1-config'
         result = self.dispatch(['config'])
-        assert yaml.load(result.stdout) == {
-            'version': '2.1',
+        assert yaml.safe_load(result.stdout) == {
+            'version': str(V1),
             'services': {
                 'net': {
                     'image': 'busybox',
@@ -442,12 +506,10 @@ class CLITestCase(DockerClientTestCase):
             },
         }
 
-    @v3_only()
     def test_config_v3(self):
         self.base_dir = 'tests/fixtures/v3-full'
         result = self.dispatch(['config'])
-
-        assert yaml.load(result.stdout) == {
+        assert yaml.safe_load(result.stdout) == {
             'version': '3.5',
             'volumes': {
                 'foobar': {
@@ -472,11 +534,11 @@ class CLITestCase(DockerClientTestCase):
                         },
                         'resources': {
                             'limits': {
-                                'cpus': '0.05',
+                                'cpus': 0.05,
                                 'memory': '50M',
                             },
                             'reservations': {
-                                'cpus': '0.01',
+                                'cpus': 0.01,
                                 'memory': '20M',
                             },
                         },
@@ -520,28 +582,30 @@ class CLITestCase(DockerClientTestCase):
             },
         }
 
+    @pytest.mark.skip(reason='deprecated option')
     def test_config_compatibility_mode(self):
         self.base_dir = 'tests/fixtures/compatibility-mode'
         result = self.dispatch(['--compatibility', 'config'])
 
-        assert yaml.load(result.stdout) == {
-            'version': '2.3',
-            'volumes': {'foo': {'driver': 'default'}},
-            'networks': {'bar': {}},
-            'services': {
-                'foo': {
-                    'command': '/bin/true',
-                    'image': 'alpine:3.7',
-                    'scale': 3,
-                    'restart': 'always:7',
-                    'mem_limit': '300M',
-                    'mem_reservation': '100M',
-                    'cpus': 0.7,
-                    'volumes': ['foo:/bar:rw'],
-                    'networks': {'bar': None},
-                }
-            },
-        }
+        assert yaml.load(result.stdout) == COMPOSE_COMPATIBILITY_DICT
+
+    @pytest.mark.skip(reason='deprecated option')
+    @mock.patch.dict(os.environ)
+    def test_config_compatibility_mode_from_env(self):
+        self.base_dir = 'tests/fixtures/compatibility-mode'
+        os.environ['COMPOSE_COMPATIBILITY'] = 'true'
+        result = self.dispatch(['config'])
+
+        assert yaml.load(result.stdout) == COMPOSE_COMPATIBILITY_DICT
+
+    @pytest.mark.skip(reason='deprecated option')
+    @mock.patch.dict(os.environ)
+    def test_config_compatibility_mode_from_env_and_option_precedence(self):
+        self.base_dir = 'tests/fixtures/compatibility-mode'
+        os.environ['COMPOSE_COMPATIBILITY'] = 'false'
+        result = self.dispatch(['--compatibility', 'config'])
+
+        assert yaml.load(result.stdout) == COMPOSE_COMPATIBILITY_DICT
 
     def test_ps(self):
         self.project.get_service('simple').create_container()
@@ -616,7 +680,7 @@ class CLITestCase(DockerClientTestCase):
     def test_pull_with_digest(self):
         result = self.dispatch(['-f', 'digest.yml', 'pull', '--no-parallel'])
 
-        assert 'Pulling simple (busybox:latest)...' in result.stderr
+        assert 'Pulling simple ({})...'.format(BUSYBOX_IMAGE_WITH_TAG) in result.stderr
         assert ('Pulling digest (busybox@'
                 'sha256:38a203e1986cf79639cfb9b2e1d6e773de84002feea2d4eb006b520'
                 '04ee8502d)...') in result.stderr
@@ -627,7 +691,7 @@ class CLITestCase(DockerClientTestCase):
             'pull', '--ignore-pull-failures', '--no-parallel']
         )
 
-        assert 'Pulling simple (busybox:latest)...' in result.stderr
+        assert 'Pulling simple ({})...'.format(BUSYBOX_IMAGE_WITH_TAG) in result.stderr
         assert 'Pulling another (nonexisting-image:latest)...' in result.stderr
         assert ('repository nonexisting-image not found' in result.stderr or
                 'image library/nonexisting-image:latest not found' in result.stderr or
@@ -654,19 +718,27 @@ class CLITestCase(DockerClientTestCase):
             result.stderr
         )
 
+    def test_pull_can_build(self):
+        result = self.dispatch([
+            '-f', 'can-build-pull-failures.yml', 'pull'],
+            returncode=0
+        )
+        assert 'Some service image(s) must be built from source' in result.stderr
+        assert 'docker-compose build can_build' in result.stderr
+
     def test_pull_with_no_deps(self):
         self.base_dir = 'tests/fixtures/links-composefile'
         result = self.dispatch(['pull', '--no-parallel', 'web'])
         assert sorted(result.stderr.split('\n'))[1:] == [
-            'Pulling web (busybox:latest)...',
+            'Pulling web (busybox:1.27.2)...',
         ]
 
     def test_pull_with_include_deps(self):
         self.base_dir = 'tests/fixtures/links-composefile'
         result = self.dispatch(['pull', '--no-parallel', '--include-deps', 'web'])
         assert sorted(result.stderr.split('\n'))[1:] == [
-            'Pulling db (busybox:latest)...',
-            'Pulling web (busybox:latest)...',
+            'Pulling db (busybox:1.27.2)...',
+            'Pulling web (busybox:1.27.2)...',
         ]
 
     def test_build_plain(self):
@@ -683,6 +755,20 @@ class CLITestCase(DockerClientTestCase):
         result = self.dispatch(['build', '--no-cache', 'simple'])
         assert BUILD_CACHE_TEXT not in result.stdout
         assert BUILD_PULL_TEXT not in result.stdout
+
+    def test_up_ignore_missing_build_directory(self):
+        self.base_dir = 'tests/fixtures/no-build'
+        result = self.dispatch(['up', '--no-build'])
+
+        assert 'alpine exited with code 0' in result.stdout
+        self.base_dir = None
+
+    def test_pull_ignore_missing_build_directory(self):
+        self.base_dir = 'tests/fixtures/no-build'
+        result = self.dispatch(['pull'])
+
+        assert 'Pulling my-alpine' in result.stderr
+        self.base_dir = None
 
     def test_build_pull(self):
         # Make sure we have the latest busybox already
@@ -706,7 +792,11 @@ class CLITestCase(DockerClientTestCase):
         assert BUILD_CACHE_TEXT not in result.stdout
         assert BUILD_PULL_TEXT in result.stdout
 
+    @mock.patch.dict(os.environ)
     def test_build_log_level(self):
+        os.environ['COMPOSE_DOCKER_CLI_BUILD'] = '0'
+        os.environ['DOCKER_BUILDKIT'] = '0'
+        self.test_env_file_relative_to_compose_file()
         self.base_dir = 'tests/fixtures/simple-dockerfile'
         result = self.dispatch(['--log-level', 'warning', 'build', 'simple'])
         assert result.stderr == ''
@@ -747,13 +837,38 @@ class CLITestCase(DockerClientTestCase):
         ]
         assert not containers
 
+    @pytest.mark.xfail(True, reason='Flaky on local')
+    def test_build_rm(self):
+        containers = [
+            Container.from_ps(self.project.client, c)
+            for c in self.project.client.containers(all=True)
+        ]
+
+        assert not containers
+
+        self.base_dir = 'tests/fixtures/simple-dockerfile'
+        self.dispatch(['build', '--no-rm', 'simple'], returncode=0)
+
+        containers = [
+            Container.from_ps(self.project.client, c)
+            for c in self.project.client.containers(all=True)
+        ]
+        assert containers
+
+        for c in self.project.client.containers(all=True):
+            self.addCleanup(self.project.client.remove_container, c, force=True)
+
+    @mock.patch.dict(os.environ)
     def test_build_shm_size_build_option(self):
+        os.environ['COMPOSE_DOCKER_CLI_BUILD'] = '0'
         pull_busybox(self.client)
         self.base_dir = 'tests/fixtures/build-shm-size'
         result = self.dispatch(['build', '--no-cache'], None)
         assert 'shm_size: 96' in result.stdout
 
+    @mock.patch.dict(os.environ)
     def test_build_memory_build_option(self):
+        os.environ['COMPOSE_DOCKER_CLI_BUILD'] = '0'
         pull_busybox(self.client)
         self.base_dir = 'tests/fixtures/build-memory'
         result = self.dispatch(['build', '--no-cache', '--memory', '96m', 'service'], None)
@@ -785,32 +900,6 @@ class CLITestCase(DockerClientTestCase):
             ['build', '--build-arg', 'favorite_th_character=hong.meiling', 'web'], None
         )
         assert 'Favorite Touhou Character: hong.meiling' in result.stdout
-
-    def test_bundle_with_digests(self):
-        self.base_dir = 'tests/fixtures/bundle-with-digests/'
-        tmpdir = pytest.ensuretemp('cli_test_bundle')
-        self.addCleanup(tmpdir.remove)
-        filename = str(tmpdir.join('example.dab'))
-
-        self.dispatch(['bundle', '--output', filename])
-        with open(filename, 'r') as fh:
-            bundle = json.load(fh)
-
-        assert bundle == {
-            'Version': '0.1',
-            'Services': {
-                'web': {
-                    'Image': ('dockercloud/hello-world@sha256:fe79a2cfbd17eefc3'
-                              '44fb8419420808df95a1e22d93b7f621a7399fd1e9dca1d'),
-                    'Networks': ['default'],
-                },
-                'redis': {
-                    'Image': ('redis@sha256:a84cb8f53a70e19f61ff2e1d5e73fb7ae62d'
-                              '374b2b7392de1e7d77be26ef8f7b'),
-                    'Networks': ['default'],
-                }
-            },
-        }
 
     def test_build_override_dir(self):
         self.base_dir = 'tests/fixtures/build-path-override-dir'
@@ -960,7 +1049,6 @@ class CLITestCase(DockerClientTestCase):
         result = self.dispatch(['down', '--rmi', 'bogus'], returncode=1)
         assert '--rmi flag must be' in result.stderr
 
-    @v2_only()
     def test_down(self):
         self.base_dir = 'tests/fixtures/v2-full'
 
@@ -1045,7 +1133,6 @@ class CLITestCase(DockerClientTestCase):
         assert '{} exited with code 0'.format(simple_name) in result.stdout
         assert '{} exited with code 0'.format(another_name) in result.stdout
 
-    @v2_only()
     def test_up(self):
         self.base_dir = 'tests/fixtures/v2-simple'
         self.dispatch(['up', '-d'], None)
@@ -1077,7 +1164,6 @@ class CLITestCase(DockerClientTestCase):
             for service in services:
                 assert self.lookup(container, service.name)
 
-    @v2_only()
     def test_up_no_start(self):
         self.base_dir = 'tests/fixtures/v2-full'
         self.dispatch(['up', '--no-start'], None)
@@ -1108,7 +1194,21 @@ class CLITestCase(DockerClientTestCase):
         ]
         assert len(remote_volumes) > 0
 
-    @v2_only()
+    def test_up_no_start_remove_orphans(self):
+        self.base_dir = 'tests/fixtures/v2-simple'
+        self.dispatch(['up', '--no-start'], None)
+
+        services = self.project.get_services()
+
+        stopped = reduce((lambda prev, next: prev.containers(
+            stopped=True) + next.containers(stopped=True)), services)
+        assert len(stopped) == 2
+
+        self.dispatch(['-f', 'one-container.yml', 'up', '--no-start', '--remove-orphans'], None)
+        stopped2 = reduce((lambda prev, next: prev.containers(
+            stopped=True) + next.containers(stopped=True)), services)
+        assert len(stopped2) == 1
+
     def test_up_no_ansi(self):
         self.base_dir = 'tests/fixtures/v2-simple'
         result = self.dispatch(['--no-ansi', 'up', '-d'], None)
@@ -1116,7 +1216,6 @@ class CLITestCase(DockerClientTestCase):
         assert "%c[1A" % 27 not in result.stderr
         assert "%c[1B" % 27 not in result.stderr
 
-    @v2_only()
     def test_up_with_default_network_config(self):
         filename = 'default-network-config.yml'
 
@@ -1130,7 +1229,6 @@ class CLITestCase(DockerClientTestCase):
 
         assert networks[0]['Options']['com.docker.network.bridge.enable_icc'] == 'false'
 
-    @v2_only()
     def test_up_with_network_aliases(self):
         filename = 'network-aliases.yml'
         self.base_dir = 'tests/fixtures/networks'
@@ -1158,7 +1256,6 @@ class CLITestCase(DockerClientTestCase):
         assert 'forward_facing' in front_aliases
         assert 'ahead' in front_aliases
 
-    @v2_only()
     def test_up_with_network_internal(self):
         self.require_api_version('1.23')
         filename = 'network-internal.yml'
@@ -1176,7 +1273,6 @@ class CLITestCase(DockerClientTestCase):
 
         assert networks[0]['Internal'] is True
 
-    @v2_only()
     def test_up_with_network_static_addresses(self):
         filename = 'network-static-addresses.yml'
         ipv4_address = '172.16.100.100'
@@ -1200,7 +1296,6 @@ class CLITestCase(DockerClientTestCase):
         assert ipv4_address in ipam_config.values()
         assert ipv6_address in ipam_config.values()
 
-    @v2_only()
     def test_up_with_networks(self):
         self.base_dir = 'tests/fixtures/networks'
         self.dispatch(['up', '-d'], None)
@@ -1248,7 +1343,6 @@ class CLITestCase(DockerClientTestCase):
         # app has aliased db to "database"
         assert self.lookup(app_container, "database")
 
-    @v2_only()
     def test_up_missing_network(self):
         self.base_dir = 'tests/fixtures/networks'
 
@@ -1258,7 +1352,6 @@ class CLITestCase(DockerClientTestCase):
 
         assert 'Service "web" uses an undefined network "foo"' in result.stderr
 
-    @v2_only()
     @no_cluster('container networks not supported in Swarm')
     def test_up_with_network_mode(self):
         c = self.client.create_container(
@@ -1297,7 +1390,6 @@ class CLITestCase(DockerClientTestCase):
         assert not container_mode_container.get('NetworkSettings.Networks')
         assert container_mode_container.get('HostConfig.NetworkMode') == container_mode_source
 
-    @v2_only()
     def test_up_external_networks(self):
         filename = 'external-networks.yml'
 
@@ -1321,7 +1413,6 @@ class CLITestCase(DockerClientTestCase):
         container = self.project.containers()[0]
         assert sorted(list(container.get('NetworkSettings.Networks'))) == sorted(network_names)
 
-    @v2_only()
     def test_up_with_external_default_network(self):
         filename = 'external-default.yml'
 
@@ -1344,7 +1435,6 @@ class CLITestCase(DockerClientTestCase):
         container = self.project.containers()[0]
         assert list(container.get('NetworkSettings.Networks')) == [network_name]
 
-    @v2_1_only()
     def test_up_with_network_labels(self):
         filename = 'network-label.yml'
 
@@ -1364,7 +1454,6 @@ class CLITestCase(DockerClientTestCase):
         assert 'label_key' in networks[0]['Labels']
         assert networks[0]['Labels']['label_key'] == 'label_val'
 
-    @v2_1_only()
     def test_up_with_volume_labels(self):
         filename = 'volume-label.yml'
 
@@ -1380,11 +1469,10 @@ class CLITestCase(DockerClientTestCase):
             if v['Name'].split('/')[-1].startswith('{}_'.format(self.project.name))
         ]
 
-        assert set([v['Name'].split('/')[-1] for v in volumes]) == set([volume_with_label])
+        assert {v['Name'].split('/')[-1] for v in volumes} == {volume_with_label}
         assert 'label_key' in volumes[0]['Labels']
         assert volumes[0]['Labels']['label_key'] == 'label_val'
 
-    @v2_only()
     def test_up_no_services(self):
         self.base_dir = 'tests/fixtures/no-services'
         self.dispatch(['up', '-d'], None)
@@ -1441,7 +1529,6 @@ class CLITestCase(DockerClientTestCase):
             bar_container.id
         )
 
-    @v3_only()
     def test_up_with_healthcheck(self):
         def wait_on_health_status(container, status):
             def condition():
@@ -1494,6 +1581,26 @@ class CLITestCase(DockerClientTestCase):
         assert len(web.containers()) == 1
         assert len(db.containers()) == 0
         assert len(console.containers()) == 0
+
+    def test_up_with_attach_dependencies(self):
+        self.base_dir = 'tests/fixtures/echo-services-dependencies'
+        result = self.dispatch(['up', '--attach-dependencies', '--no-color', 'simple'], None)
+        simple_name = self.project.get_service('simple').containers(stopped=True)[0].name_without_project
+        another_name = self.project.get_service('another').containers(
+            stopped=True
+        )[0].name_without_project
+
+        assert '{}   | simple'.format(simple_name) in result.stdout
+        assert '{}  | another'.format(another_name) in result.stdout
+
+    def test_up_handles_aborted_dependencies(self):
+        self.base_dir = 'tests/fixtures/abort-on-container-exit-dependencies'
+        proc = start_process(
+            self.base_dir,
+            ['up', 'simple', '--attach-dependencies', '--abort-on-container-exit'])
+        wait_on_condition(ContainerCountCondition(self.project, 0))
+        proc.wait()
+        assert proc.returncode == 1
 
     def test_up_with_force_recreate(self):
         self.dispatch(['up', '-d'], None)
@@ -1555,7 +1662,6 @@ class CLITestCase(DockerClientTestCase):
         os.kill(proc.pid, signal.SIGTERM)
         wait_on_condition(ContainerCountCondition(self.project, 0))
 
-    @v2_only()
     def test_up_handles_force_shutdown(self):
         self.base_dir = 'tests/fixtures/sleeps-composefile'
         proc = start_process(self.base_dir, ['up', '-t', '200'])
@@ -1580,7 +1686,6 @@ class CLITestCase(DockerClientTestCase):
         proc.wait()
         assert proc.returncode == 1
 
-    @v2_only()
     @no_cluster('Container PID mode does not work across clusters')
     def test_up_with_pid_mode(self):
         c = self.client.create_container(
@@ -1606,6 +1711,123 @@ class CLITestCase(DockerClientTestCase):
         host_mode_container = self.project.get_service('host').containers()[0]
         assert host_mode_container.get('HostConfig.PidMode') == 'host'
 
+    @no_cluster('Container IPC mode does not work across clusters')
+    def test_up_with_ipc_mode(self):
+        c = self.client.create_container(
+            'busybox', 'top', name='composetest_ipc_mode_container',
+            host_config={}
+        )
+        self.addCleanup(self.client.remove_container, c, force=True)
+        self.client.start(c)
+        container_mode_source = 'container:{}'.format(c['Id'])
+
+        self.base_dir = 'tests/fixtures/ipc-mode'
+
+        self.dispatch(['up', '-d'], None)
+
+        service_mode_source = 'container:{}'.format(
+            self.project.get_service('shareable').containers()[0].id)
+        service_mode_container = self.project.get_service('service').containers()[0]
+        assert service_mode_container.get('HostConfig.IpcMode') == service_mode_source
+
+        container_mode_container = self.project.get_service('container').containers()[0]
+        assert container_mode_container.get('HostConfig.IpcMode') == container_mode_source
+
+        shareable_mode_container = self.project.get_service('shareable').containers()[0]
+        assert shareable_mode_container.get('HostConfig.IpcMode') == 'shareable'
+
+    def test_profiles_up_with_no_profile(self):
+        self.base_dir = 'tests/fixtures/profiles'
+        self.dispatch(['up'])
+
+        containers = self.project.containers(stopped=True)
+        service_names = [c.service for c in containers]
+
+        assert 'foo' in service_names
+        assert len(containers) == 1
+
+    def test_profiles_up_with_profile(self):
+        self.base_dir = 'tests/fixtures/profiles'
+        self.dispatch(['--profile', 'test', 'up'])
+
+        containers = self.project.containers(stopped=True)
+        service_names = [c.service for c in containers]
+
+        assert 'foo' in service_names
+        assert 'bar' in service_names
+        assert 'baz' in service_names
+        assert len(containers) == 3
+
+    def test_profiles_up_invalid_dependency(self):
+        self.base_dir = 'tests/fixtures/profiles'
+        result = self.dispatch(['--profile', 'debug', 'up'], returncode=1)
+
+        assert ('Service "bar" was pulled in as a dependency of service "zot" '
+                'but is not enabled by the active profiles.') in result.stderr
+
+    def test_profiles_up_with_multiple_profiles(self):
+        self.base_dir = 'tests/fixtures/profiles'
+        self.dispatch(['--profile', 'debug', '--profile', 'test', 'up'])
+
+        containers = self.project.containers(stopped=True)
+        service_names = [c.service for c in containers]
+
+        assert 'foo' in service_names
+        assert 'bar' in service_names
+        assert 'baz' in service_names
+        assert 'zot' in service_names
+        assert len(containers) == 4
+
+    def test_profiles_up_with_profile_enabled_by_service(self):
+        self.base_dir = 'tests/fixtures/profiles'
+        self.dispatch(['up', 'bar'])
+
+        containers = self.project.containers(stopped=True)
+        service_names = [c.service for c in containers]
+
+        assert 'bar' in service_names
+        assert len(containers) == 1
+
+    def test_profiles_up_with_dependency_and_profile_enabled_by_service(self):
+        self.base_dir = 'tests/fixtures/profiles'
+        self.dispatch(['up', 'baz'])
+
+        containers = self.project.containers(stopped=True)
+        service_names = [c.service for c in containers]
+
+        assert 'bar' in service_names
+        assert 'baz' in service_names
+        assert len(containers) == 2
+
+    def test_profiles_up_with_invalid_dependency_for_target_service(self):
+        self.base_dir = 'tests/fixtures/profiles'
+        result = self.dispatch(['up', 'zot'], returncode=1)
+
+        assert ('Service "bar" was pulled in as a dependency of service "zot" '
+                'but is not enabled by the active profiles.') in result.stderr
+
+    def test_profiles_up_with_profile_for_dependency(self):
+        self.base_dir = 'tests/fixtures/profiles'
+        self.dispatch(['--profile', 'test', 'up', 'zot'])
+
+        containers = self.project.containers(stopped=True)
+        service_names = [c.service for c in containers]
+
+        assert 'bar' in service_names
+        assert 'zot' in service_names
+        assert len(containers) == 2
+
+    def test_profiles_up_with_merged_profiles(self):
+        self.base_dir = 'tests/fixtures/profiles'
+        self.dispatch(['-f', 'docker-compose.yml', '-f', 'merge-profiles.yml', 'up', 'zot'])
+
+        containers = self.project.containers(stopped=True)
+        service_names = [c.service for c in containers]
+
+        assert 'bar' in service_names
+        assert 'zot' in service_names
+        assert len(containers) == 2
+
     def test_exec_without_tty(self):
         self.base_dir = 'tests/fixtures/links-composefile'
         self.dispatch(['up', '-d', 'console'])
@@ -1614,6 +1836,17 @@ class CLITestCase(DockerClientTestCase):
         stdout, stderr = self.dispatch(['exec', '-T', 'console', 'ls', '-1d', '/'])
         assert stderr == ""
         assert stdout == "/\n"
+
+    @mock.patch.dict(os.environ)
+    def test_exec_novalue_var_dotenv_file(self):
+        os.environ['MYVAR'] = 'SUCCESS'
+        self.base_dir = 'tests/fixtures/exec-novalue-var'
+        self.dispatch(['up', '-d'])
+        assert len(self.project.containers()) == 1
+
+        stdout, stderr = self.dispatch(['exec', '-T', 'nginx', 'env'])
+        assert 'CHECK_VAR=SUCCESS' in stdout
+        assert not stderr
 
     def test_exec_detach_long_form(self):
         self.base_dir = 'tests/fixtures/links-composefile'
@@ -1633,7 +1866,6 @@ class CLITestCase(DockerClientTestCase):
         assert stdout == "operator\n"
         assert stderr == ""
 
-    @v3_only()
     def test_exec_workdir(self):
         self.base_dir = 'tests/fixtures/links-composefile'
         os.environ['COMPOSE_API_VERSION'] = '1.35'
@@ -1643,7 +1875,6 @@ class CLITestCase(DockerClientTestCase):
         stdout, stderr = self.dispatch(['exec', '-T', '--workdir', '/etc', 'console', 'ls'])
         assert 'passwd' in stdout
 
-    @v2_2_only()
     def test_exec_service_with_environment_overridden(self):
         name = 'service'
         self.base_dir = 'tests/fixtures/environment-exec'
@@ -1688,7 +1919,6 @@ class CLITestCase(DockerClientTestCase):
         assert len(db.containers()) == 1
         assert len(console.containers()) == 0
 
-    @v2_only()
     def test_run_service_with_dependencies(self):
         self.base_dir = 'tests/fixtures/v2-dependencies'
         self.dispatch(['run', 'web', '/bin/true'], None)
@@ -1696,6 +1926,14 @@ class CLITestCase(DockerClientTestCase):
         console = self.project.get_service('console')
         assert len(db.containers()) == 1
         assert len(console.containers()) == 0
+
+    def test_run_service_with_unhealthy_dependencies(self):
+        self.base_dir = 'tests/fixtures/v2-unhealthy-dependencies'
+        result = self.dispatch(['run', 'web', '/bin/true'], returncode=1)
+        assert re.search(
+            re.compile('for web .*is unhealthy.*', re.MULTILINE),
+            result.stderr
+        )
 
     def test_run_service_with_scaled_dependencies(self):
         self.base_dir = 'tests/fixtures/v2-dependencies'
@@ -1736,12 +1974,12 @@ class CLITestCase(DockerClientTestCase):
         self.dispatch(['run', 'implicit'])
         service = self.project.get_service('implicit')
         containers = service.containers(stopped=True, one_off=OneOffFilter.only)
-        assert [c.human_readable_command for c in containers] == [u'/bin/sh -c echo "success"']
+        assert [c.human_readable_command for c in containers] == ['/bin/sh -c echo "success"']
 
         self.dispatch(['run', 'explicit'])
         service = self.project.get_service('explicit')
         containers = service.containers(stopped=True, one_off=OneOffFilter.only)
-        assert [c.human_readable_command for c in containers] == [u'/bin/true']
+        assert [c.human_readable_command for c in containers] == ['/bin/true']
 
     @pytest.mark.skipif(SWARM_SKIP_RM_VOLUMES, reason='Swarm DELETE /containers/<id> bug')
     def test_run_rm(self):
@@ -2000,7 +2238,6 @@ class CLITestCase(DockerClientTestCase):
         container = service.containers(stopped=True, one_off=True)[0]
         assert workdir == container.get('Config.WorkingDir')
 
-    @v2_only()
     def test_run_service_with_use_aliases(self):
         filename = 'network-aliases.yml'
         self.base_dir = 'tests/fixtures/networks'
@@ -2022,7 +2259,6 @@ class CLITestCase(DockerClientTestCase):
         assert 'forward_facing' in front_aliases
         assert 'ahead' in front_aliases
 
-    @v2_only()
     def test_run_interactive_connects_to_network(self):
         self.base_dir = 'tests/fixtures/networks'
 
@@ -2045,10 +2281,9 @@ class CLITestCase(DockerClientTestCase):
             for _, config in networks.items():
                 # TODO: once we drop support for API <1.24, this can be changed to:
                 # assert config['Aliases'] == [container.short_id]
-                aliases = set(config['Aliases'] or []) - set([container.short_id])
+                aliases = set(config['Aliases'] or []) - {container.short_id}
                 assert not aliases
 
-    @v2_only()
     def test_run_detached_connects_to_network(self):
         self.base_dir = 'tests/fixtures/networks'
         self.dispatch(['up', '-d'])
@@ -2065,7 +2300,7 @@ class CLITestCase(DockerClientTestCase):
         for _, config in networks.items():
             # TODO: once we drop support for API <1.24, this can be changed to:
             # assert config['Aliases'] == [container.short_id]
-            aliases = set(config['Aliases'] or []) - set([container.short_id])
+            aliases = set(config['Aliases'] or []) - {container.short_id}
             assert not aliases
 
         assert self.lookup(container, 'app')
@@ -2113,15 +2348,9 @@ class CLITestCase(DockerClientTestCase):
     @mock.patch.dict(os.environ)
     def test_run_unicode_env_values_from_system(self):
         value = 'ą, ć, ę, ł, ń, ó, ś, ź, ż'
-        if six.PY2:  # os.environ doesn't support unicode values in Py2
-            os.environ['BAR'] = value.encode('utf-8')
-        else:  # ... and doesn't support byte values in Py3
-            os.environ['BAR'] = value
+        os.environ['BAR'] = value
         self.base_dir = 'tests/fixtures/unicode-environment'
-        result = self.dispatch(['run', 'simple'])
-
-        if six.PY2:  # Can't retrieve output on Py3. See issue #3670
-            assert value in result.stdout.strip()
+        self.dispatch(['run', 'simple'])
 
         container = self.project.containers(one_off=OneOffFilter.only, stopped=True)[0]
         environment = container.get('Config.Env')
@@ -2233,7 +2462,6 @@ class CLITestCase(DockerClientTestCase):
         assert 'failed' in result.stderr
         assert 'No containers to start' in result.stderr
 
-    @v2_only()
     def test_up_logging(self):
         self.base_dir = 'tests/fixtures/logging-composefile'
         self.dispatch(['up', '-d'])
@@ -2301,6 +2529,7 @@ class CLITestCase(DockerClientTestCase):
         assert 'another' in result.stdout
         assert 'exited with code 0' in result.stdout
 
+    @pytest.mark.skip(reason="race condition between up and logs")
     def test_logs_follow_logs_from_new_containers(self):
         self.base_dir = 'tests/fixtures/logs-composefile'
         self.dispatch(['up', '-d', 'simple'])
@@ -2327,6 +2556,7 @@ class CLITestCase(DockerClientTestCase):
         assert '{} exited with code 0'.format(another_name) in result.stdout
         assert '{} exited with code 137'.format(simple_name) in result.stdout
 
+    @pytest.mark.skip(reason="race condition between up and logs")
     def test_logs_follow_logs_from_restarted_containers(self):
         self.base_dir = 'tests/fixtures/logs-restart-composefile'
         proc = start_process(self.base_dir, ['up'])
@@ -2347,6 +2577,7 @@ class CLITestCase(DockerClientTestCase):
         ) == 3
         assert result.stdout.count('world') == 3
 
+    @pytest.mark.skip(reason="race condition between up and logs")
     def test_logs_default(self):
         self.base_dir = 'tests/fixtures/logs-composefile'
         self.dispatch(['up', '-d'])
@@ -2461,11 +2692,6 @@ class CLITestCase(DockerClientTestCase):
         assert len(project.get_service('simple').containers()) == 0
         assert len(project.get_service('another').containers()) == 0
 
-    def test_scale_v2_2(self):
-        self.base_dir = 'tests/fixtures/scale'
-        result = self.dispatch(['scale', 'web=1'], returncode=1)
-        assert 'incompatible with the v2.2 format' in result.stderr
-
     def test_up_scale_scale_up(self):
         self.base_dir = 'tests/fixtures/scale'
         project = self.project
@@ -2473,10 +2699,12 @@ class CLITestCase(DockerClientTestCase):
         self.dispatch(['up', '-d'])
         assert len(project.get_service('web').containers()) == 2
         assert len(project.get_service('db').containers()) == 1
+        assert len(project.get_service('worker').containers()) == 0
 
-        self.dispatch(['up', '-d', '--scale', 'web=3'])
+        self.dispatch(['up', '-d', '--scale', 'web=3', '--scale', 'worker=1'])
         assert len(project.get_service('web').containers()) == 3
         assert len(project.get_service('db').containers()) == 1
+        assert len(project.get_service('worker').containers()) == 1
 
     def test_up_scale_scale_down(self):
         self.base_dir = 'tests/fixtures/scale'
@@ -2485,22 +2713,26 @@ class CLITestCase(DockerClientTestCase):
         self.dispatch(['up', '-d'])
         assert len(project.get_service('web').containers()) == 2
         assert len(project.get_service('db').containers()) == 1
+        assert len(project.get_service('worker').containers()) == 0
 
         self.dispatch(['up', '-d', '--scale', 'web=1'])
         assert len(project.get_service('web').containers()) == 1
         assert len(project.get_service('db').containers()) == 1
+        assert len(project.get_service('worker').containers()) == 0
 
     def test_up_scale_reset(self):
         self.base_dir = 'tests/fixtures/scale'
         project = self.project
 
-        self.dispatch(['up', '-d', '--scale', 'web=3', '--scale', 'db=3'])
+        self.dispatch(['up', '-d', '--scale', 'web=3', '--scale', 'db=3', '--scale', 'worker=3'])
         assert len(project.get_service('web').containers()) == 3
         assert len(project.get_service('db').containers()) == 3
+        assert len(project.get_service('worker').containers()) == 3
 
         self.dispatch(['up', '-d'])
         assert len(project.get_service('web').containers()) == 2
         assert len(project.get_service('db').containers()) == 1
+        assert len(project.get_service('worker').containers()) == 0
 
     def test_up_scale_to_zero(self):
         self.base_dir = 'tests/fixtures/scale'
@@ -2509,10 +2741,12 @@ class CLITestCase(DockerClientTestCase):
         self.dispatch(['up', '-d'])
         assert len(project.get_service('web').containers()) == 2
         assert len(project.get_service('db').containers()) == 1
+        assert len(project.get_service('worker').containers()) == 0
 
-        self.dispatch(['up', '-d', '--scale', 'web=0', '--scale', 'db=0'])
+        self.dispatch(['up', '-d', '--scale', 'web=0', '--scale', 'db=0', '--scale', 'worker=0'])
         assert len(project.get_service('web').containers()) == 0
         assert len(project.get_service('db').containers()) == 0
+        assert len(project.get_service('worker').containers()) == 0
 
     def test_port(self):
         self.base_dir = 'tests/fixtures/ports-composefile'
@@ -2575,7 +2809,7 @@ class CLITestCase(DockerClientTestCase):
             str_iso_date, str_iso_time, container_info = string.split(' ', 2)
             try:
                 return isinstance(datetime.datetime.strptime(
-                    '%s %s' % (str_iso_date, str_iso_time),
+                    '{} {}'.format(str_iso_date, str_iso_time),
                     '%Y-%m-%d %H:%M:%S.%f'),
                     datetime.datetime)
             except ValueError:
@@ -2592,7 +2826,7 @@ class CLITestCase(DockerClientTestCase):
 
         container, = self.project.containers()
         expected_template = ' container {} {}'
-        expected_meta_info = ['image=busybox:latest', 'name=simple-composefile_simple_']
+        expected_meta_info = ['image=busybox:1.27.2', 'name=simple-composefile_simple_']
 
         assert expected_template.format('create', container.id) in lines[0]
         assert expected_template.format('start', container.id) in lines[1]
@@ -2664,7 +2898,7 @@ class CLITestCase(DockerClientTestCase):
         self.base_dir = 'tests/fixtures/extends'
         self.dispatch(['up', '-d'], None)
 
-        assert set([s.name for s in self.project.services]) == set(['mydb', 'myweb'])
+        assert {s.name for s in self.project.services} == {'mydb', 'myweb'}
 
         # Sort by name so we get [db, web]
         containers = sorted(
@@ -2676,15 +2910,9 @@ class CLITestCase(DockerClientTestCase):
         web = containers[1]
         db_name = containers[0].name_without_project
 
-        assert set(get_links(web)) == set(
-            ['db', db_name, 'extends_{}'.format(db_name)]
-        )
+        assert set(get_links(web)) == {'db', db_name, 'extends_{}'.format(db_name)}
 
-        expected_env = set([
-            "FOO=1",
-            "BAR=2",
-            "BAZ=2",
-        ])
+        expected_env = {"FOO=1", "BAR=2", "BAZ=2"}
         assert expected_env <= set(web.get('Config.Env'))
 
     def test_top_services_not_running(self):
@@ -2739,8 +2967,8 @@ class CLITestCase(DockerClientTestCase):
         result = self.dispatch(['images'])
 
         assert 'busybox' in result.stdout
-        assert 'multiple-composefiles_another_1' in result.stdout
-        assert 'multiple-composefiles_simple_1' in result.stdout
+        assert '_another_1' in result.stdout
+        assert '_simple_1' in result.stdout
 
     @mock.patch.dict(os.environ)
     def test_images_tagless_image(self):
@@ -2788,4 +3016,139 @@ class CLITestCase(DockerClientTestCase):
 
         assert re.search(r'foo1.+test[ \t]+dev', result.stdout) is not None
         assert re.search(r'foo2.+test[ \t]+prod', result.stdout) is not None
-        assert re.search(r'foo3.+_foo3[ \t]+latest', result.stdout) is not None
+        assert re.search(r'foo3.+test[ \t]+latest', result.stdout) is not None
+
+    def test_build_with_stop_process_flag(self):
+        self.base_dir = 'tests/fixtures/flag-as-service-name'
+        result = self.dispatch(['build', '--pull', '--', '--test-service'])
+
+        assert BUILD_PULL_TEXT in result.stdout
+
+    def test_events_with_stop_process_flag(self):
+        self.base_dir = 'tests/fixtures/flag-as-service-name'
+        events_proc = start_process(self.base_dir, ['events', '--json', '--', '--test-service'])
+        self.dispatch(['up', '-d', '--', '--test-service'])
+        wait_on_condition(ContainerCountCondition(self.project, 1))
+
+        os.kill(events_proc.pid, signal.SIGINT)
+        result = wait_on_process(events_proc, returncode=1)
+        lines = [json.loads(line) for line in result.stdout.rstrip().split('\n')]
+        assert Counter(e['action'] for e in lines) == {'create': 1, 'start': 1}
+
+    def test_exec_with_stop_process_flag(self):
+        self.base_dir = 'tests/fixtures/flag-as-service-name'
+        self.dispatch(['up', '-d', '--', '--test-service'])
+        assert len(self.project.containers()) == 1
+
+        stdout, stderr = self.dispatch(['exec', '-T', '--', '--test-service', 'ls', '-1d', '/'])
+
+        assert stderr == ""
+        assert stdout == "/\n"
+
+    def test_images_with_stop_process_flag(self):
+        self.base_dir = 'tests/fixtures/flag-as-service-name'
+        self.dispatch(['up', '-d', '--', '--test-service'])
+        result = self.dispatch(['images', '--', '--test-service'])
+
+        assert "busybox" in result.stdout
+
+    def test_kill_with_stop_process_flag(self):
+        self.base_dir = 'tests/fixtures/flag-as-service-name'
+        self.dispatch(['up', '-d', '--', '--test-service'])
+        service = self.project.get_service('--test-service')
+
+        assert len(service.containers()) == 1
+        assert service.containers()[0].is_running
+
+        self.dispatch(['kill', '--', '--test-service'])
+
+        assert len(service.containers(stopped=True)) == 1
+        assert not service.containers(stopped=True)[0].is_running
+
+    def test_logs_with_stop_process_flag(self):
+        self.base_dir = 'tests/fixtures/flag-as-service-name'
+        self.dispatch(['up', '-d', '--', '--log-service'])
+        result = self.dispatch(['logs', '--', '--log-service'])
+
+        assert 'hello' in result.stdout
+        assert 'exited with' not in result.stdout
+
+    def test_port_with_stop_process_flag(self):
+        self.base_dir = 'tests/fixtures/flag-as-service-name'
+        self.dispatch(['up', '-d', '--', '--test-service'])
+        result = self.dispatch(['port', '--', '--test-service', '80'])
+
+        assert result.stdout.strip() == "0.0.0.0:8080"
+
+    def test_ps_with_stop_process_flag(self):
+        self.base_dir = 'tests/fixtures/flag-as-service-name'
+        self.dispatch(['up', '-d', '--', '--test-service'])
+
+        result = self.dispatch(['ps', '--', '--test-service'])
+
+        assert 'flag-as-service-name_--test-service_1' in result.stdout
+
+    def test_pull_with_stop_process_flag(self):
+        self.base_dir = 'tests/fixtures/flag-as-service-name'
+        result = self.dispatch(['pull', '--', '--test-service'])
+
+        assert 'Pulling --test-service' in result.stderr
+        assert 'failed' not in result.stderr
+
+    def test_rm_with_stop_process_flag(self):
+        self.base_dir = 'tests/fixtures/flag-as-service-name'
+        self.dispatch(['up', '--no-start', '--', '--test-service'])
+        service = self.project.get_service('--test-service')
+        assert len(service.containers(stopped=True)) == 1
+
+        self.dispatch(['rm', '--force', '--', '--test-service'])
+        assert len(service.containers(stopped=True)) == 0
+
+    def test_run_with_stop_process_flag(self):
+        self.base_dir = 'tests/fixtures/flag-as-service-name'
+        result = self.dispatch(['run', '--no-deps', '--', '--test-service', 'echo', '-hello'])
+
+        assert 'hello' in result.stdout
+        assert len(self.project.containers()) == 0
+
+    def test_stop_with_stop_process_flag(self):
+        self.base_dir = 'tests/fixtures/flag-as-service-name'
+        self.dispatch(['up', '-d', '--', '--test-service'])
+        service = self.project.get_service('--test-service')
+        assert len(service.containers()) == 1
+        assert service.containers()[0].is_running
+
+        self.dispatch(['stop', '-t', '1', '--', '--test-service'])
+
+        assert len(service.containers(stopped=True)) == 1
+        assert not service.containers(stopped=True)[0].is_running
+
+    def test_restart_with_stop_process_flag(self):
+        self.base_dir = 'tests/fixtures/flag-as-service-name'
+        self.dispatch(['up', '-d', '--', '--test-service'])
+        service = self.project.get_service('--test-service')
+        assert len(service.containers()) == 1
+        assert service.containers()[0].is_running
+
+        self.dispatch(['restart', '-t', '1', '--', '--test-service'])
+
+        assert len(service.containers()) == 1
+        assert service.containers()[0].is_running
+
+    def test_up_with_stop_process_flag(self):
+        self.base_dir = 'tests/fixtures/flag-as-service-name'
+        self.dispatch(['up', '-d', '--', '--test-service', '--log-service'])
+
+        service = self.project.get_service('--test-service')
+        another = self.project.get_service('--log-service')
+        assert len(service.containers()) == 1
+        assert len(another.containers()) == 1
+
+    def test_up_no_log_prefix(self):
+        self.base_dir = 'tests/fixtures/echo-services'
+        result = self.dispatch(['up', '--no-log-prefix'])
+
+        assert 'simple' in result.stdout
+        assert 'another' in result.stdout
+        assert 'exited with code 0' in result.stdout
+        assert 'exited with code 0' in result.stdout

@@ -1,6 +1,9 @@
 ---
 name: Feature request
 about: Suggest an idea to improve Compose
+title: ''
+labels: kind/feature
+assignees: ''
 
 ---
 
@@ -15,6 +18,9 @@ Welcome to the docker-compose issue tracker! Before creating an issue, please he
 2. Use the search function before creating a new issue. Duplicates will be closed and directed to
    the original discussion.
 -->
+
+/!\ If your request is about evolving the compose file format, please report on the [Compose Specification](https://github.com/compose-spec/compose-spec)
+
 
 **Is your feature request related to a problem? Please describe.**
 A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]

@@ -1,26 +1,29 @@
-from __future__ import absolute_import
-from __future__ import unicode_literals
-
 import logging
-import os
+from shutil import get_terminal_size
 
-import six
 import texttable
 
 from compose.cli import colors
 
 
 def get_tty_width():
-    tty_size = os.popen('stty size 2> /dev/null', 'r').read().split()
-    if len(tty_size) != 2:
+    try:
+        # get_terminal_size can't determine the size if compose is piped
+        # to another command. But in such case it doesn't make sense to
+        # try format the output by terminal size as this output is consumed
+        # by another command. So let's pretend we have a huge terminal so
+        # output is single-lined
+        width, _ = get_terminal_size(fallback=(999, 0))
+        return int(width)
+    except OSError:
         return 0
-    _, width = tty_size
-    return int(width)
 
 
-class Formatter(object):
+class Formatter:
     """Format tabular data for printing."""
-    def table(self, headers, rows):
+
+    @staticmethod
+    def table(headers, rows):
         table = texttable.Texttable(max_width=get_tty_width())
         table.set_cols_dtype(['t' for h in headers])
         table.add_rows([headers] + rows)
@@ -37,15 +40,15 @@ class ConsoleWarningFormatter(logging.Formatter):
 
     def get_level_message(self, record):
         separator = ': '
-        if record.levelno == logging.WARNING:
-            return colors.yellow(record.levelname) + separator
-        if record.levelno == logging.ERROR:
+        if record.levelno >= logging.ERROR:
             return colors.red(record.levelname) + separator
+        if record.levelno >= logging.WARNING:
+            return colors.yellow(record.levelname) + separator
 
         return ''
 
     def format(self, record):
-        if isinstance(record.msg, six.binary_type):
+        if isinstance(record.msg, bytes):
             record.msg = record.msg.decode('utf-8')
-        message = super(ConsoleWarningFormatter, self).format(record)
-        return '{0}{1}'.format(self.get_level_message(record), message)
+        message = super().format(record)
+        return '{}{}'.format(self.get_level_message(record), message)

@@ -1,17 +1,15 @@
-from __future__ import absolute_import
-from __future__ import unicode_literals
-
+import enum
 import itertools
 import logging
 import os
 import re
+import subprocess
 import sys
+import tempfile
 from collections import namedtuple
 from collections import OrderedDict
 from operator import attrgetter
 
-import enum
-import six
 from docker.errors import APIError
 from docker.errors import ImageNotFound
 from docker.errors import NotFound
@@ -46,6 +44,7 @@ from .const import LABEL_VERSION
 from .const import NANOCPUS_SCALE
 from .const import WINDOWS_LONGPATH_PREFIX
 from .container import Container
+from .errors import CompletedUnsuccessfully
 from .errors import HealthCheckFailed
 from .errors import NoHealthCheckConfigured
 from .errors import OperationFailedError
@@ -58,10 +57,10 @@ from .utils import parse_bytes
 from .utils import parse_seconds_float
 from .utils import truncate_id
 from .utils import unique_everseen
+from compose.cli.utils import binarystr_to_unicode
 
 
 log = logging.getLogger(__name__)
-
 
 HOST_CONFIG_KEYS = [
     'cap_add',
@@ -78,6 +77,7 @@ HOST_CONFIG_KEYS = [
     'cpuset',
     'device_cgroup_rules',
     'devices',
+    'device_requests',
     'dns',
     'dns_search',
     'dns_opt',
@@ -112,6 +112,7 @@ HOST_CONFIG_KEYS = [
 
 CONDITION_STARTED = 'service_started'
 CONDITION_HEALTHY = 'service_healthy'
+CONDITION_COMPLETED_SUCCESSFULLY = 'service_completed_successfully'
 
 
 class BuildError(Exception):
@@ -130,7 +131,6 @@ class NoSuchImageError(Exception):
 
 
 ServiceName = namedtuple('ServiceName', 'project service number')
-
 
 ConvergencePlan = namedtuple('ConvergencePlan', 'action containers')
 
@@ -165,22 +165,24 @@ class BuildAction(enum.Enum):
     skip = 2
 
 
-class Service(object):
+class Service:
     def __init__(
-        self,
-        name,
-        client=None,
-        project='default',
-        use_networking=False,
-        links=None,
-        volumes_from=None,
-        network_mode=None,
-        networks=None,
-        secrets=None,
-        scale=None,
-        pid_mode=None,
-        default_platform=None,
-        **options
+            self,
+            name,
+            client=None,
+            project='default',
+            use_networking=False,
+            links=None,
+            volumes_from=None,
+            network_mode=None,
+            networks=None,
+            secrets=None,
+            scale=1,
+            ipc_mode=None,
+            pid_mode=None,
+            default_platform=None,
+            extra_labels=None,
+            **options
     ):
         self.name = name
         self.client = client
@@ -188,13 +190,15 @@ class Service(object):
         self.use_networking = use_networking
         self.links = links or []
         self.volumes_from = volumes_from or []
+        self.ipc_mode = ipc_mode or IpcMode(None)
         self.network_mode = network_mode or NetworkMode(None)
         self.pid_mode = pid_mode or PidMode(None)
         self.networks = networks or {}
         self.secrets = secrets or []
-        self.scale_num = scale or 1
+        self.scale_num = scale
         self.default_platform = default_platform
         self.options = options
+        self.extra_labels = extra_labels or []
 
     def __repr__(self):
         return '<Service: {}>'.format(self.name)
@@ -209,7 +213,7 @@ class Service(object):
             for container in self.client.containers(
                 all=stopped,
                 filters=filters)])
-        )
+                      )
         if result:
             return result
 
@@ -228,10 +232,10 @@ class Service(object):
         """Return a :class:`compose.container.Container` for this service. The
         container must be active, and match `number`.
         """
-        for container in self.containers(labels=['{0}={1}'.format(LABEL_CONTAINER_NUMBER, number)]):
+        for container in self.containers(labels=['{}={}'.format(LABEL_CONTAINER_NUMBER, number)]):
             return container
 
-        raise ValueError("No container found for %s_%s" % (self.name, number))
+        raise ValueError("No container found for {}_{}".format(self.name, number))
 
     def start(self, **options):
         containers = self.containers(stopped=True)
@@ -241,15 +245,15 @@ class Service(object):
 
     def show_scale_warnings(self, desired_num):
         if self.custom_container_name and desired_num > 1:
-            log.warn('The "%s" service is using the custom container name "%s". '
-                     'Docker requires each container to have a unique name. '
-                     'Remove the custom name to scale the service.'
-                     % (self.name, self.custom_container_name))
+            log.warning('The "%s" service is using the custom container name "%s". '
+                        'Docker requires each container to have a unique name. '
+                        'Remove the custom name to scale the service.'
+                        % (self.name, self.custom_container_name))
 
         if self.specifies_host_port() and desired_num > 1:
-            log.warn('The "%s" service specifies a port on the host. If multiple containers '
-                     'for this service are created on a single host, the port will clash.'
-                     % self.name)
+            log.warning('The "%s" service specifies a port on the host. If multiple containers '
+                        'for this service are created on a single host, the port will clash.'
+                        % self.name)
 
     def scale(self, desired_num, timeout=None):
         """
@@ -337,11 +341,11 @@ class Service(object):
             return Container.create(self.client, **container_options)
         except APIError as ex:
             raise OperationFailedError("Cannot create container for service %s: %s" %
-                                       (self.name, ex.explanation))
+                                       (self.name, binarystr_to_unicode(ex.explanation)))
 
-    def ensure_image_exists(self, do_build=BuildAction.none, silent=False):
+    def ensure_image_exists(self, do_build=BuildAction.none, silent=False, cli=False):
         if self.can_be_built() and do_build == BuildAction.force:
-            self.build()
+            self.build(cli=cli)
             return
 
         try:
@@ -357,8 +361,8 @@ class Service(object):
         if do_build == BuildAction.skip:
             raise NeedsBuildError(self)
 
-        self.build()
-        log.warn(
+        self.build(cli=cli)
+        log.warning(
             "Image for service {} was built because it did not already exist. To "
             "rebuild this image you must use `docker-compose build` or "
             "`docker-compose up --build`.".format(self.name))
@@ -388,8 +392,11 @@ class Service(object):
             platform = self.default_platform
         return platform
 
-    def convergence_plan(self, strategy=ConvergenceStrategy.changed):
+    def convergence_plan(self, strategy=ConvergenceStrategy.changed, one_off=False):
         containers = self.containers(stopped=True)
+
+        if one_off:
+            return ConvergencePlan('one_off', [])
 
         if not containers:
             return ConvergencePlan('create', [])
@@ -398,15 +405,15 @@ class Service(object):
             return ConvergencePlan('start', containers)
 
         if (
-            strategy is ConvergenceStrategy.always or
-            self._containers_have_diverged(containers)
+                strategy is ConvergenceStrategy.always or
+                self._containers_have_diverged(containers)
         ):
             return ConvergencePlan('recreate', containers)
 
         stopped = [c for c in containers if not c.is_running]
 
         if stopped:
-            return ConvergencePlan('start', stopped)
+            return ConvergencePlan('start', containers)
 
         return ConvergencePlan('noop', containers)
 
@@ -418,7 +425,7 @@ class Service(object):
         except NoSuchImageError as e:
             log.debug(
                 'Service %s has diverged: %s',
-                self.name, six.text_type(e),
+                self.name, str(e),
             )
             return True
 
@@ -439,17 +446,29 @@ class Service(object):
 
         return has_diverged
 
-    def _execute_convergence_create(self, scale, detached, start):
+    def _execute_convergence_create(self, scale, detached, start, one_off=False, override_options=None):
 
         i = self._next_container_number()
 
         def create_and_start(service, n):
-            container = service.create_container(number=n, quiet=True)
+            if one_off:
+                container = service.create_container(one_off=True, quiet=True, **override_options)
+            else:
+                container = service.create_container(number=n, quiet=True)
             if not detached:
                 container.attach_log_stream()
-            if start:
+            if start and not one_off:
                 self.start_container(container)
             return container
+
+        def get_name(service_name):
+            if one_off:
+                return "_".join([
+                    service_name.project,
+                    service_name.service,
+                    "run",
+                ])
+            return self.get_container_name(service_name.service, service_name.number)
 
         containers, errors = parallel_execute(
             [
@@ -457,7 +476,7 @@ class Service(object):
                 for index in range(i, i + scale)
             ],
             lambda service_name: create_and_start(self, service_name.number),
-            lambda service_name: self.get_container_name(service_name.service, service_name.number),
+            get_name,
             "Creating"
         )
         for error in errors.values():
@@ -476,6 +495,7 @@ class Service(object):
                 container, timeout=timeout, attach_logs=not detached,
                 start_new_container=start, renew_anonymous_volumes=renew_anonymous_volumes
             )
+
         containers, errors = parallel_execute(
             containers,
             recreate,
@@ -496,8 +516,9 @@ class Service(object):
             self._downscale(containers[scale:], timeout)
             containers = containers[:scale]
         if start:
+            stopped = [c for c in containers if not c.is_running]
             _, errors = parallel_execute(
-                containers,
+                stopped,
                 lambda c: self.start_container_if_stopped(c, attach_logs=not detached, quiet=True),
                 lambda c: c.name,
                 "Starting",
@@ -527,16 +548,20 @@ class Service(object):
     def execute_convergence_plan(self, plan, timeout=None, detached=False,
                                  start=True, scale_override=None,
                                  rescale=True, reset_container_image=False,
-                                 renew_anonymous_volumes=False):
+                                 renew_anonymous_volumes=False, override_options=None):
         (action, containers) = plan
         scale = scale_override if scale_override is not None else self.scale_num
         containers = sorted(containers, key=attrgetter('number'))
 
         self.show_scale_warnings(scale)
 
-        if action == 'create':
+        if action in ['create', 'one_off']:
             return self._execute_convergence_create(
-                scale, detached, start
+                scale,
+                detached,
+                start,
+                one_off=(action == 'one_off'),
+                override_options=override_options
             )
 
         # The create action needs always needs an initial scale, but otherwise,
@@ -617,7 +642,10 @@ class Service(object):
         try:
             container.start()
         except APIError as ex:
-            raise OperationFailedError("Cannot start service %s: %s" % (self.name, ex.explanation))
+            expl = binarystr_to_unicode(ex.explanation)
+            if "driver failed programming external connectivity" in expl:
+                log.warn("Host is already in use by another container")
+            raise OperationFailedError("Cannot start service {}: {}".format(self.name, expl))
         return container
 
     @property
@@ -685,42 +713,50 @@ class Service(object):
             'image_id': image_id(),
             'links': self.get_link_names(),
             'net': self.network_mode.id,
+            'ipc_mode': self.ipc_mode.mode,
             'networks': self.networks,
+            'secrets': self.secrets,
             'volumes_from': [
                 (v.source.name, v.mode)
                 for v in self.volumes_from if isinstance(v.source, Service)
-            ],
+            ]
         }
 
     def get_dependency_names(self):
         net_name = self.network_mode.service_name
         pid_namespace = self.pid_mode.service_name
+        ipc_namespace = self.ipc_mode.service_name
         return (
-            self.get_linked_service_names() +
-            self.get_volumes_from_names() +
-            ([net_name] if net_name else []) +
-            ([pid_namespace] if pid_namespace else []) +
-            list(self.options.get('depends_on', {}).keys())
+                self.get_linked_service_names() +
+                self.get_volumes_from_names() +
+                ([net_name] if net_name else []) +
+                ([pid_namespace] if pid_namespace else []) +
+                ([ipc_namespace] if ipc_namespace else []) +
+                list(self.options.get('depends_on', {}).keys())
         )
 
     def get_dependency_configs(self):
         net_name = self.network_mode.service_name
         pid_namespace = self.pid_mode.service_name
+        ipc_namespace = self.ipc_mode.service_name
 
-        configs = dict(
-            [(name, None) for name in self.get_linked_service_names()]
+        configs = {
+            name: None for name in self.get_linked_service_names()
+        }
+        configs.update(
+            (name, None) for name in self.get_volumes_from_names()
         )
-        configs.update(dict(
-            [(name, None) for name in self.get_volumes_from_names()]
-        ))
         configs.update({net_name: None} if net_name else {})
         configs.update({pid_namespace: None} if pid_namespace else {})
+        configs.update({ipc_namespace: None} if ipc_namespace else {})
         configs.update(self.options.get('depends_on', {}))
         for svc, config in self.options.get('depends_on', {}).items():
             if config['condition'] == CONDITION_STARTED:
                 configs[svc] = lambda s: True
             elif config['condition'] == CONDITION_HEALTHY:
                 configs[svc] = lambda s: s.is_healthy()
+            elif config['condition'] == CONDITION_COMPLETED_SUCCESSFULLY:
+                configs[svc] = lambda s: s.is_completed_successfully()
             else:
                 # The config schema already prevents this, but it might be
                 # bypassed if Compose is called programmatically.
@@ -833,9 +869,9 @@ class Service(object):
         add_config_hash = (not one_off and not override_options)
         slug = generate_random_id() if one_off else None
 
-        container_options = dict(
-            (k, self.options[k])
-            for k in DOCKER_CONFIG_KEYS if k in self.options)
+        container_options = {
+            k: self.options[k]
+            for k in DOCKER_CONFIG_KEYS if k in self.options}
         override_volumes = override_options.pop('volumes', [])
         container_options.update(override_options)
 
@@ -890,7 +926,7 @@ class Service(object):
 
         container_options['labels'] = build_container_labels(
             container_options.get('labels', {}),
-            self.labels(one_off=one_off),
+            self.labels(one_off=one_off) + self.extra_labels,
             number,
             self.config_hash if add_config_hash else None,
             slug
@@ -927,7 +963,7 @@ class Service(object):
         )
         container_options['environment'].update(affinity)
 
-        container_options['volumes'] = dict((v.internal, {}) for v in container_volumes or {})
+        container_options['volumes'] = {v.internal: {} for v in container_volumes or {}}
         if version_gte(self.client.api_version, '1.30'):
             override_options['mounts'] = [build_mount(v) for v in container_mounts] or None
         else:
@@ -963,7 +999,7 @@ class Service(object):
         blkio_config = convert_blkio_config(options.get('blkio_config', None))
         log_config = get_log_config(logging_dict)
         init_path = None
-        if isinstance(options.get('init'), six.string_types):
+        if isinstance(options.get('init'), str):
             init_path = options.get('init')
             options['init'] = True
 
@@ -985,6 +1021,7 @@ class Service(object):
             privileged=options.get('privileged', False),
             network_mode=self.network_mode.mode,
             devices=options.get('devices'),
+            device_requests=options.get('device_requests'),
             dns=options.get('dns'),
             dns_opt=options.get('dns_opt'),
             dns_search=options.get('dns_search'),
@@ -1001,7 +1038,7 @@ class Service(object):
             read_only=options.get('read_only'),
             pid_mode=self.pid_mode.mode,
             security_opt=security_opt,
-            ipc_mode=options.get('ipc'),
+            ipc_mode=self.ipc_mode.mode,
             cgroup_parent=options.get('cgroup_parent'),
             cpu_quota=options.get('cpu_quota'),
             shm_size=options.get('shm_size'),
@@ -1049,8 +1086,11 @@ class Service(object):
         return [build_spec(secret) for secret in self.secrets]
 
     def build(self, no_cache=False, pull=False, force_rm=False, memory=None, build_args_override=None,
-              gzip=False):
-        log.info('Building %s' % self.name)
+              gzip=False, rm=True, silent=False, cli=False, progress=None):
+        output_stream = open(os.devnull, 'w')
+        if not silent:
+            output_stream = sys.stdout
+            log.info('Building %s' % self.name)
 
         build_opts = self.options.get('build', {})
 
@@ -1067,15 +1107,17 @@ class Service(object):
                 'Impossible to perform platform-targeted builds for API version < 1.35'
             )
 
-        build_output = self.client.build(
+        builder = _ClientBuilder(self.client) if not cli else _CLIBuilder(progress)
+        return builder.build(
+            service=self,
             path=path,
             tag=self.image_name,
-            rm=True,
+            rm=rm,
             forcerm=force_rm,
             pull=pull,
             nocache=no_cache,
             dockerfile=build_opts.get('dockerfile', None),
-            cache_from=build_opts.get('cache_from', None),
+            cache_from=self.get_cache_from(build_opts),
             labels=build_opts.get('labels', None),
             buildargs=build_args,
             network_mode=build_opts.get('network', None),
@@ -1088,30 +1130,13 @@ class Service(object):
             gzip=gzip,
             isolation=build_opts.get('isolation', self.options.get('isolation', None)),
             platform=self.platform,
-        )
+            output_stream=output_stream)
 
-        try:
-            all_events = list(stream_output(build_output, sys.stdout))
-        except StreamOutputError as e:
-            raise BuildError(self, six.text_type(e))
-
-        # Ensure the HTTP connection is not reused for another
-        # streaming command, as the Docker daemon can sometimes
-        # complain about it
-        self.client.close()
-
-        image_id = None
-
-        for event in all_events:
-            if 'stream' in event:
-                match = re.search(r'Successfully built ([0-9a-f]+)', event.get('stream', ''))
-                if match:
-                    image_id = match.group(1)
-
-        if image_id is None:
-            raise BuildError(self, event if all_events else 'Unknown')
-
-        return image_id
+    def get_cache_from(self, build_opts):
+        cache_from = build_opts.get('cache_from', None)
+        if cache_from is not None:
+            cache_from = [tag for tag in cache_from if tag]
+        return cache_from
 
     def can_be_built(self):
         return 'build' in self.options
@@ -1119,9 +1144,9 @@ class Service(object):
     def labels(self, one_off=False, legacy=False):
         proj_name = self.project if not legacy else re.sub(r'[_-]', '', self.project)
         return [
-            '{0}={1}'.format(LABEL_PROJECT, proj_name),
-            '{0}={1}'.format(LABEL_SERVICE, self.name),
-            '{0}={1}'.format(LABEL_ONE_OFF, "True" if one_off else "False"),
+            '{}={}'.format(LABEL_PROJECT, proj_name),
+            '{}={}'.format(LABEL_SERVICE, self.name),
+            '{}={}'.format(LABEL_ONE_OFF, "True" if one_off else "False"),
         ]
 
     @property
@@ -1135,10 +1160,10 @@ class Service(object):
         container_name = build_container_name(
             self.project, service_name, number, slug,
         )
-        ext_links_origins = [l.split(':')[0] for l in self.options.get('external_links', [])]
+        ext_links_origins = [link.split(':')[0] for link in self.options.get('external_links', [])]
         if container_name in ext_links_origins:
             raise DependencyError(
-                'Service {0} has a self-referential external link: {1}'.format(
+                'Service {} has a self-referential external link: {}'.format(
                     self.name, container_name
                 )
             )
@@ -1193,16 +1218,14 @@ class Service(object):
             output = self.client.pull(repo, **pull_kwargs)
             if silent:
                 with open(os.devnull, 'w') as devnull:
-                    for event in stream_output(output, devnull):
-                        yield event
+                    yield from stream_output(output, devnull)
             else:
-                for event in stream_output(output, sys.stdout):
-                    yield event
+                yield from stream_output(output, sys.stdout)
         except (StreamOutputError, NotFound) as e:
             if not ignore_pull_failures:
                 raise
             else:
-                log.error(six.text_type(e))
+                log.error(str(e))
 
     def pull(self, ignore_pull_failures=False, silent=False, stream=False):
         if 'image' not in self.options:
@@ -1215,7 +1238,7 @@ class Service(object):
             'platform': self.platform,
         }
         if not silent:
-            log.info('Pulling %s (%s%s%s)...' % (self.name, repo, separator, tag))
+            log.info('Pulling {} ({}{}{})...'.format(self.name, repo, separator, tag))
 
         if kwargs['platform'] and version_lt(self.client.api_version, '1.35'):
             raise OperationFailedError(
@@ -1233,7 +1256,7 @@ class Service(object):
 
         repo, tag, separator = parse_repository_tag(self.options['image'])
         tag = tag or 'latest'
-        log.info('Pushing %s (%s%s%s)...' % (self.name, repo, separator, tag))
+        log.info('Pushing {} ({}{}{})...'.format(self.name, repo, separator, tag))
         output = self.client.push(repo, tag=tag, stream=True)
 
         try:
@@ -1243,7 +1266,7 @@ class Service(object):
             if not ignore_push_failures:
                 raise
             else:
-                log.error(six.text_type(e))
+                log.error(str(e))
 
     def is_healthy(self):
         """ Check that all containers for this service report healthy.
@@ -1261,6 +1284,21 @@ class Service(object):
                 result = False
             elif status == 'unhealthy':
                 raise HealthCheckFailed(ctnr.short_id)
+        return result
+
+    def is_completed_successfully(self):
+        """ Check that all containers for this service has completed successfully
+            Returns false if at least one container does not exited and
+            raises CompletedUnsuccessfully exception if at least one container
+            exited with non-zero exit code.
+        """
+        result = True
+        for ctnr in self.containers(stopped=True):
+            ctnr.inspect()
+            if ctnr.get('State.Status') != 'exited':
+                result = False
+            elif ctnr.exit_code != 0:
+                raise CompletedUnsuccessfully(ctnr.short_id, ctnr.exit_code)
         return result
 
     def _parse_proxy_config(self):
@@ -1288,6 +1326,24 @@ class Service(object):
 
         return result
 
+    def get_profiles(self):
+        if 'profiles' not in self.options:
+            return []
+
+        return self.options.get('profiles')
+
+    def enabled_for_profiles(self, enabled_profiles):
+        # if service has no profiles specified it is always enabled
+        if 'profiles' not in self.options:
+            return True
+
+        service_profiles = self.options.get('profiles')
+        for profile in enabled_profiles:
+            if profile in service_profiles:
+                return True
+
+        return False
+
 
 def short_id_alias_exists(container, network):
     aliases = container.get(
@@ -1295,7 +1351,47 @@ def short_id_alias_exists(container, network):
     return container.short_id in aliases
 
 
-class PidMode(object):
+class IpcMode:
+    def __init__(self, mode):
+        self._mode = mode
+
+    @property
+    def mode(self):
+        return self._mode
+
+    @property
+    def service_name(self):
+        return None
+
+
+class ServiceIpcMode(IpcMode):
+    def __init__(self, service):
+        self.service = service
+
+    @property
+    def service_name(self):
+        return self.service.name
+
+    @property
+    def mode(self):
+        containers = self.service.containers()
+        if containers:
+            return 'container:' + containers[0].id
+
+        log.warning(
+            "Service %s is trying to use reuse the IPC namespace "
+            "of another service that is not running." % (self.service_name)
+        )
+        return None
+
+
+class ContainerIpcMode(IpcMode):
+    def __init__(self, container):
+        self.container = container
+        self._mode = 'container:{}'.format(container.id)
+
+
+class PidMode:
     def __init__(self, mode):
         self._mode = mode
 
@@ -1322,7 +1418,7 @@ class ServicePidMode(PidMode):
         if containers:
             return 'container:' + containers[0].id
 
-        log.warn(
+        log.warning(
             "Service %s is trying to use reuse the PID namespace "
             "of another service that is not running." % (self.service_name)
         )
@@ -1335,7 +1431,7 @@ class ContainerPidMode(PidMode):
         self._mode = 'container:{}'.format(container.id)
 
 
-class NetworkMode(object):
+class NetworkMode:
     """A `standard` network mode (ex: host, bridge)"""
 
     service_name = None
@@ -1350,7 +1446,7 @@ class NetworkMode(object):
     mode = id
 
 
-class ContainerNetworkMode(object):
+class ContainerNetworkMode:
     """A network mode that uses a container's network stack."""
 
     service_name = None
@@ -1367,7 +1463,7 @@ class ContainerNetworkMode(object):
         return 'container:' + self.container.id
 
 
-class ServiceNetworkMode(object):
+class ServiceNetworkMode:
     """A network mode that uses a service's network stack."""
 
     def __init__(self, service):
@@ -1385,8 +1481,8 @@ class ServiceNetworkMode(object):
         if containers:
             return 'container:' + containers[0].id
 
-        log.warn("Service %s is trying to use reuse the network stack "
-                 "of another service that is not running." % (self.id))
+        log.warning("Service %s is trying to use reuse the network stack "
+                    "of another service that is not running." % (self.id))
         return None
 
 
@@ -1472,10 +1568,10 @@ def get_container_data_volumes(container, volumes_option, tmpfs_option, mounts_o
     volumes = []
     volumes_option = volumes_option or []
 
-    container_mounts = dict(
-        (mount['Destination'], mount)
+    container_mounts = {
+        mount['Destination']: mount
         for mount in container.get('Mounts') or {}
-    )
+    }
 
     image_volumes = [
         VolumeSpec.parse(volume)
@@ -1527,17 +1623,17 @@ def get_container_data_volumes(container, volumes_option, tmpfs_option, mounts_o
 
 
 def warn_on_masked_volume(volumes_option, container_volumes, service):
-    container_volumes = dict(
-        (volume.internal, volume.external)
-        for volume in container_volumes)
+    container_volumes = {
+        volume.internal: volume.external
+        for volume in container_volumes}
 
     for volume in volumes_option:
         if (
-            volume.external and
-            volume.internal in container_volumes and
-            container_volumes.get(volume.internal) != volume.external
+                volume.external and
+                volume.internal in container_volumes and
+                container_volumes.get(volume.internal) != volume.external
         ):
-            log.warn((
+            log.warning((
                 "Service \"{service}\" is using volume \"{volume}\" from the "
                 "previous container. Host mapping \"{host_path}\" has no effect. "
                 "Remove the existing containers (with `docker-compose rm {service}`) "
@@ -1582,6 +1678,7 @@ def build_mount(mount_spec):
         read_only=mount_spec.read_only, consistency=mount_spec.consistency, **kwargs
     )
 
+
 # Labels
 
 
@@ -1608,8 +1705,8 @@ def build_ulimits(ulimit_config):
     if not ulimit_config:
         return None
     ulimits = []
-    for limit_name, soft_hard_values in six.iteritems(ulimit_config):
-        if isinstance(soft_hard_values, six.integer_types):
+    for limit_name, soft_hard_values in ulimit_config.items():
+        if isinstance(soft_hard_values, int):
             ulimits.append({'name': limit_name, 'soft': soft_hard_values, 'hard': soft_hard_values})
         elif isinstance(soft_hard_values, dict):
             ulimit_dict = {'name': limit_name}
@@ -1633,9 +1730,10 @@ def format_environment(environment):
     def format_env(key, value):
         if value is None:
             return key
-        if isinstance(value, six.binary_type):
+        if isinstance(value, bytes):
             value = value.decode('utf-8')
         return '{key}={value}'.format(key=key, value=value)
+
     return [format_env(*item) for item in environment.items()]
 
 
@@ -1677,18 +1775,205 @@ def convert_blkio_config(blkio_config):
             continue
         arr = []
         for item in blkio_config[field]:
-            arr.append(dict([(k.capitalize(), v) for k, v in item.items()]))
+            arr.append({k.capitalize(): v for k, v in item.items()})
         result[field] = arr
     return result
 
 
 def rewrite_build_path(path):
-    # python2 os.stat() doesn't support unicode on some UNIX, so we
-    # encode it to a bytestring to be safe
-    if not six.PY3 and not IS_WINDOWS_PLATFORM:
-        path = path.encode('utf8')
-
     if IS_WINDOWS_PLATFORM and not is_url(path) and not path.startswith(WINDOWS_LONGPATH_PREFIX):
         path = WINDOWS_LONGPATH_PREFIX + os.path.normpath(path)
 
     return path
+
+
+class _ClientBuilder:
+    def __init__(self, client):
+        self.client = client
+
+    def build(self, service, path, tag=None, quiet=False, fileobj=None,
+              nocache=False, rm=False, timeout=None,
+              custom_context=False, encoding=None, pull=False,
+              forcerm=False, dockerfile=None, container_limits=None,
+              decode=False, buildargs=None, gzip=False, shmsize=None,
+              labels=None, cache_from=None, target=None, network_mode=None,
+              squash=None, extra_hosts=None, platform=None, isolation=None,
+              use_config_proxy=True, output_stream=sys.stdout):
+        build_output = self.client.build(
+            path=path,
+            tag=tag,
+            nocache=nocache,
+            rm=rm,
+            pull=pull,
+            forcerm=forcerm,
+            dockerfile=dockerfile,
+            labels=labels,
+            cache_from=cache_from,
+            buildargs=buildargs,
+            network_mode=network_mode,
+            target=target,
+            shmsize=shmsize,
+            extra_hosts=extra_hosts,
+            container_limits=container_limits,
+            gzip=gzip,
+            isolation=isolation,
+            platform=platform)
+
+        try:
+            all_events = list(stream_output(build_output, output_stream))
+        except StreamOutputError as e:
+            raise BuildError(service, str(e))
+
+        # Ensure the HTTP connection is not reused for another
+        # streaming command, as the Docker daemon can sometimes
+        # complain about it
+        self.client.close()
+
+        image_id = None
+
+        for event in all_events:
+            if 'stream' in event:
+                match = re.search(r'Successfully built ([0-9a-f]+)', event.get('stream', ''))
+                if match:
+                    image_id = match.group(1)
+
+        if image_id is None:
+            raise BuildError(service, event if all_events else 'Unknown')
+
+        return image_id
+
+
+class _CLIBuilder:
+    def __init__(self, progress):
+        self._progress = progress
+
+    def build(self, service, path, tag=None, quiet=False, fileobj=None,
+              nocache=False, rm=False, timeout=None,
+              custom_context=False, encoding=None, pull=False,
+              forcerm=False, dockerfile=None, container_limits=None,
+              decode=False, buildargs=None, gzip=False, shmsize=None,
+              labels=None, cache_from=None, target=None, network_mode=None,
+              squash=None, extra_hosts=None, platform=None, isolation=None,
+              use_config_proxy=True, output_stream=sys.stdout):
+        """
+        Args:
+            service (str): Service to be built
+            path (str): Path to the directory containing the Dockerfile
+            buildargs (dict): A dictionary of build arguments
+            cache_from (:py:class:`list`): A list of images used for build
+                cache resolution
+            container_limits (dict): A dictionary of limits applied to each
+                container created by the build process. Valid keys:
+                - memory (int): set memory limit for build
+                - memswap (int): Total memory (memory + swap), -1 to disable
+                    swap
+                - cpushares (int): CPU shares (relative weight)
+                - cpusetcpus (str): CPUs in which to allow execution, e.g.,
+                    ``"0-3"``, ``"0,1"``
+            custom_context (bool): Optional if using ``fileobj``
+            decode (bool): If set to ``True``, the returned stream will be
+                decoded into dicts on the fly. Default ``False``
+            dockerfile (str): path within the build context to the Dockerfile
+            encoding (str): The encoding for a stream. Set to ``gzip`` for
+                compressing
+            extra_hosts (dict): Extra hosts to add to /etc/hosts in building
+                containers, as a mapping of hostname to IP address.
+            fileobj: A file object to use as the Dockerfile. (Or a file-like
+                object)
+            forcerm (bool): Always remove intermediate containers, even after
+                unsuccessful builds
+            isolation (str): Isolation technology used during build.
+                Default: `None`.
+            labels (dict): A dictionary of labels to set on the image
+            network_mode (str): networking mode for the run commands during
+                build
+            nocache (bool): Don't use the cache when set to ``True``
+            platform (str): Platform in the format ``os[/arch[/variant]]``
+            pull (bool): Downloads any updates to the FROM image in Dockerfiles
+            quiet (bool): Whether to return the status
+            rm (bool): Remove intermediate containers. The ``docker build``
+                command now defaults to ``--rm=true``, but we have kept the old
+                default of `False` to preserve backward compatibility
+            shmsize (int): Size of `/dev/shm` in bytes. The size must be
+                greater than 0. If omitted the system uses 64MB
+            squash (bool): Squash the resulting images layers into a
+                single layer.
+            tag (str): A tag to add to the final image
+            target (str): Name of the build-stage to build in a multi-stage
+                Dockerfile
+            timeout (int): HTTP timeout
+            use_config_proxy (bool): If ``True``, and if the docker client
+                configuration file (``~/.docker/config.json`` by default)
+                contains a proxy configuration, the corresponding environment
+                variables will be set in the container being built.
+            output_stream (writer): stream to use for build logs
+        Returns:
+            A generator for the build output.
+        """
+        if dockerfile and os.path.isdir(path):
+            dockerfile = os.path.join(path, dockerfile)
+        iidfile = tempfile.mktemp()
+
+        command_builder = _CommandBuilder()
+        command_builder.add_params("--build-arg", buildargs)
+        command_builder.add_list("--cache-from", cache_from)
+        command_builder.add_arg("--file", dockerfile)
+        command_builder.add_flag("--force-rm", forcerm)
+        command_builder.add_params("--label", labels)
+        command_builder.add_arg("--memory", container_limits.get("memory"))
+        command_builder.add_arg("--network", network_mode)
+        command_builder.add_flag("--no-cache", nocache)
+        command_builder.add_arg("--progress", self._progress)
+        command_builder.add_flag("--pull", pull)
+        command_builder.add_arg("--tag", tag)
+        command_builder.add_arg("--target", target)
+        command_builder.add_arg("--iidfile", iidfile)
+        command_builder.add_arg("--platform", platform)
+        command_builder.add_arg("--isolation", isolation)
+
+        if extra_hosts:
+            if isinstance(extra_hosts, dict):
+                extra_hosts = ["{}:{}".format(host, ip) for host, ip in extra_hosts.items()]
+            for host in extra_hosts:
+                command_builder.add_arg("--add-host", "{}".format(host))
+
+        args = command_builder.build([path])
+
+        with subprocess.Popen(args, stdout=output_stream, stderr=sys.stderr,
+                              universal_newlines=True) as p:
+            p.communicate()
+            if p.returncode != 0:
+                raise BuildError(service, "Build failed")
+
+        with open(iidfile) as f:
+            line = f.readline()
+            image_id = line.split(":")[1].strip()
+        os.remove(iidfile)
+
+        return image_id
+
+
+class _CommandBuilder:
+    def __init__(self):
+        self._args = ["docker", "build"]
+
+    def add_arg(self, name, value):
+        if value:
+            self._args.extend([name, str(value)])
+
+    def add_flag(self, name, flag):
+        if flag:
+            self._args.extend([name])
+
+    def add_params(self, name, params):
+        if params:
+            for key, val in params.items():
+                self._args.extend([name, "{}={}".format(key, val)])
+
+    def add_list(self, name, values):
+        if values:
+            for val in values:
+                self._args.extend([name, val])
+
+    def build(self, args):
+        return self._args + args

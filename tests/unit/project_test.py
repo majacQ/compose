@@ -1,8 +1,6 @@
-# encoding: utf-8
-from __future__ import absolute_import
-from __future__ import unicode_literals
-
 import datetime
+import os
+import tempfile
 
 import docker
 import pytest
@@ -10,19 +8,34 @@ from docker.errors import NotFound
 
 from .. import mock
 from .. import unittest
+from ..helpers import BUSYBOX_IMAGE_WITH_TAG
+from compose.config import ConfigurationError
 from compose.config.config import Config
 from compose.config.types import VolumeFromSpec
+from compose.const import COMPOSE_SPEC as VERSION
 from compose.const import COMPOSEFILE_V1 as V1
-from compose.const import COMPOSEFILE_V2_0 as V2_0
-from compose.const import COMPOSEFILE_V2_4 as V2_4
+from compose.const import DEFAULT_TIMEOUT
 from compose.const import LABEL_SERVICE
 from compose.container import Container
 from compose.errors import OperationFailedError
+from compose.project import get_secrets
 from compose.project import NoSuchService
 from compose.project import Project
 from compose.project import ProjectError
 from compose.service import ImageType
 from compose.service import Service
+
+
+def build_config(**kwargs):
+    return Config(
+        config_version=kwargs.get('config_version', VERSION),
+        version=kwargs.get('version', VERSION),
+        services=kwargs.get('services'),
+        volumes=kwargs.get('volumes'),
+        networks=kwargs.get('networks'),
+        secrets=kwargs.get('secrets'),
+        configs=kwargs.get('configs'),
+    )
 
 
 class ProjectTest(unittest.TestCase):
@@ -32,16 +45,16 @@ class ProjectTest(unittest.TestCase):
         self.mock_client.api_version = docker.constants.DEFAULT_DOCKER_API_VERSION
 
     def test_from_config_v1(self):
-        config = Config(
+        config = build_config(
             version=V1,
             services=[
                 {
                     'name': 'web',
-                    'image': 'busybox:latest',
+                    'image': BUSYBOX_IMAGE_WITH_TAG,
                 },
                 {
                     'name': 'db',
-                    'image': 'busybox:latest',
+                    'image': BUSYBOX_IMAGE_WITH_TAG,
                 },
             ],
             networks=None,
@@ -56,23 +69,22 @@ class ProjectTest(unittest.TestCase):
         )
         assert len(project.services) == 2
         assert project.get_service('web').name == 'web'
-        assert project.get_service('web').options['image'] == 'busybox:latest'
+        assert project.get_service('web').options['image'] == BUSYBOX_IMAGE_WITH_TAG
         assert project.get_service('db').name == 'db'
-        assert project.get_service('db').options['image'] == 'busybox:latest'
+        assert project.get_service('db').options['image'] == BUSYBOX_IMAGE_WITH_TAG
         assert not project.networks.use_networking
 
     @mock.patch('compose.network.Network.true_name', lambda n: n.full_name)
     def test_from_config_v2(self):
-        config = Config(
-            version=V2_0,
+        config = build_config(
             services=[
                 {
                     'name': 'web',
-                    'image': 'busybox:latest',
+                    'image': BUSYBOX_IMAGE_WITH_TAG,
                 },
                 {
                     'name': 'db',
-                    'image': 'busybox:latest',
+                    'image': BUSYBOX_IMAGE_WITH_TAG,
                 },
             ],
             networks=None,
@@ -89,7 +101,7 @@ class ProjectTest(unittest.TestCase):
             project='composetest',
             name='web',
             client=None,
-            image="busybox:latest",
+            image=BUSYBOX_IMAGE_WITH_TAG,
         )
         project = Project('test', [web], None)
         assert project.get_service('web') == web
@@ -170,11 +182,10 @@ class ProjectTest(unittest.TestCase):
         project = Project.from_config(
             name='test',
             client=self.mock_client,
-            config_data=Config(
-                version=V2_0,
+            config_data=build_config(
                 services=[{
                     'name': 'test',
-                    'image': 'busybox:latest',
+                    'image': BUSYBOX_IMAGE_WITH_TAG,
                     'volumes_from': [VolumeFromSpec('aaa', 'rw', 'container')]
                 }],
                 networks=None,
@@ -192,22 +203,21 @@ class ProjectTest(unittest.TestCase):
                 "Name": container_name,
                 "Names": [container_name],
                 "Id": container_name,
-                "Image": 'busybox:latest'
+                "Image": BUSYBOX_IMAGE_WITH_TAG
             }
         ]
         project = Project.from_config(
             name='test',
             client=self.mock_client,
-            config_data=Config(
-                version=V2_0,
+            config_data=build_config(
                 services=[
                     {
                         'name': 'vol',
-                        'image': 'busybox:latest'
+                        'image': BUSYBOX_IMAGE_WITH_TAG
                     },
                     {
                         'name': 'test',
-                        'image': 'busybox:latest',
+                        'image': BUSYBOX_IMAGE_WITH_TAG,
                         'volumes_from': [VolumeFromSpec('vol', 'rw', 'service')]
                     }
                 ],
@@ -226,16 +236,15 @@ class ProjectTest(unittest.TestCase):
         project = Project.from_config(
             name='test',
             client=None,
-            config_data=Config(
-                version=V2_0,
+            config_data=build_config(
                 services=[
                     {
                         'name': 'vol',
-                        'image': 'busybox:latest'
+                        'image': BUSYBOX_IMAGE_WITH_TAG
                     },
                     {
                         'name': 'test',
-                        'image': 'busybox:latest',
+                        'image': BUSYBOX_IMAGE_WITH_TAG,
                         'volumes_from': [VolumeFromSpec('vol', 'rw', 'service')]
                     }
                 ],
@@ -536,12 +545,12 @@ class ProjectTest(unittest.TestCase):
         project = Project.from_config(
             name='test',
             client=self.mock_client,
-            config_data=Config(
+            config_data=build_config(
                 version=V1,
                 services=[
                     {
                         'name': 'test',
-                        'image': 'busybox:latest',
+                        'image': BUSYBOX_IMAGE_WITH_TAG,
                     }
                 ],
                 networks=None,
@@ -561,12 +570,11 @@ class ProjectTest(unittest.TestCase):
         project = Project.from_config(
             name='test',
             client=self.mock_client,
-            config_data=Config(
-                version=V2_0,
+            config_data=build_config(
                 services=[
                     {
                         'name': 'test',
-                        'image': 'busybox:latest',
+                        'image': BUSYBOX_IMAGE_WITH_TAG,
                         'network_mode': 'container:aaa'
                     },
                 ],
@@ -586,22 +594,21 @@ class ProjectTest(unittest.TestCase):
                 "Name": container_name,
                 "Names": [container_name],
                 "Id": container_name,
-                "Image": 'busybox:latest'
+                "Image": BUSYBOX_IMAGE_WITH_TAG
             }
         ]
         project = Project.from_config(
             name='test',
             client=self.mock_client,
-            config_data=Config(
-                version=V2_0,
+            config_data=build_config(
                 services=[
                     {
                         'name': 'aaa',
-                        'image': 'busybox:latest'
+                        'image': BUSYBOX_IMAGE_WITH_TAG
                     },
                     {
                         'name': 'test',
-                        'image': 'busybox:latest',
+                        'image': BUSYBOX_IMAGE_WITH_TAG,
                         'network_mode': 'service:aaa'
                     },
                 ],
@@ -619,12 +626,11 @@ class ProjectTest(unittest.TestCase):
         project = Project.from_config(
             name='test',
             client=self.mock_client,
-            config_data=Config(
-                version=V2_0,
+            config_data=build_config(
                 services=[
                     {
                         'name': 'foo',
-                        'image': 'busybox:latest'
+                        'image': BUSYBOX_IMAGE_WITH_TAG
                     },
                 ],
                 networks=None,
@@ -640,12 +646,11 @@ class ProjectTest(unittest.TestCase):
         project = Project.from_config(
             name='test',
             client=self.mock_client,
-            config_data=Config(
-                version=V2_0,
+            config_data=build_config(
                 services=[
                     {
                         'name': 'foo',
-                        'image': 'busybox:latest',
+                        'image': BUSYBOX_IMAGE_WITH_TAG,
                         'networks': {'custom': None}
                     },
                 ],
@@ -660,9 +665,9 @@ class ProjectTest(unittest.TestCase):
 
     def test_container_without_name(self):
         self.mock_client.containers.return_value = [
-            {'Image': 'busybox:latest', 'Id': '1', 'Name': '1'},
-            {'Image': 'busybox:latest', 'Id': '2', 'Name': None},
-            {'Image': 'busybox:latest', 'Id': '3'},
+            {'Image': BUSYBOX_IMAGE_WITH_TAG, 'Id': '1', 'Name': '1'},
+            {'Image': BUSYBOX_IMAGE_WITH_TAG, 'Id': '2', 'Name': None},
+            {'Image': BUSYBOX_IMAGE_WITH_TAG, 'Id': '3'},
         ]
         self.mock_client.inspect_container.return_value = {
             'Id': '1',
@@ -675,11 +680,10 @@ class ProjectTest(unittest.TestCase):
         project = Project.from_config(
             name='test',
             client=self.mock_client,
-            config_data=Config(
-                version=V2_0,
+            config_data=build_config(
                 services=[{
                     'name': 'web',
-                    'image': 'busybox:latest',
+                    'image': BUSYBOX_IMAGE_WITH_TAG,
                 }],
                 networks=None,
                 volumes=None,
@@ -693,11 +697,10 @@ class ProjectTest(unittest.TestCase):
         project = Project.from_config(
             name='test',
             client=self.mock_client,
-            config_data=Config(
-                version=V2_0,
+            config_data=build_config(
                 services=[{
                     'name': 'web',
-                    'image': 'busybox:latest',
+                    'image': BUSYBOX_IMAGE_WITH_TAG,
                 }],
                 networks={'default': {}},
                 volumes={'data': {}},
@@ -709,7 +712,7 @@ class ProjectTest(unittest.TestCase):
         self.mock_client.remove_volume.side_effect = NotFound(None, None, 'oops')
 
         project.down(ImageType.all, True)
-        self.mock_client.remove_image.assert_called_once_with("busybox:latest")
+        self.mock_client.remove_image.assert_called_once_with(BUSYBOX_IMAGE_WITH_TAG)
 
     def test_no_warning_on_stop(self):
         self.mock_client.info.return_value = {'Swarm': {'LocalNodeState': 'active'}}
@@ -736,16 +739,16 @@ class ProjectTest(unittest.TestCase):
             assert fake_log.warn.call_count == 0
 
     def test_no_such_service_unicode(self):
-        assert NoSuchService('十六夜　咲夜'.encode('utf-8')).msg == 'No such service: 十六夜　咲夜'
+        assert NoSuchService('十六夜　咲夜'.encode()).msg == 'No such service: 十六夜　咲夜'
         assert NoSuchService('十六夜　咲夜').msg == 'No such service: 十六夜　咲夜'
 
     def test_project_platform_value(self):
         service_config = {
             'name': 'web',
-            'image': 'busybox:latest',
+            'image': BUSYBOX_IMAGE_WITH_TAG,
         }
-        config_data = Config(
-            version=V2_4, services=[service_config], networks={}, volumes={}, secrets=None, configs=None
+        config_data = build_config(
+            services=[service_config], networks={}, volumes={}, secrets=None, configs=None
         )
 
         project = Project.from_config(name='test', client=self.mock_client, config_data=config_data)
@@ -765,16 +768,42 @@ class ProjectTest(unittest.TestCase):
         )
         assert project.get_service('web').platform == 'linux/s390x'
 
+    def test_build_container_operation_with_timeout_func_does_not_mutate_options_with_timeout(self):
+        config_data = build_config(
+            services=[
+                {'name': 'web', 'image': BUSYBOX_IMAGE_WITH_TAG},
+                {'name': 'db', 'image': BUSYBOX_IMAGE_WITH_TAG, 'stop_grace_period': '1s'},
+            ],
+            networks={}, volumes={}, secrets=None, configs=None,
+        )
+
+        project = Project.from_config(name='test', client=self.mock_client, config_data=config_data)
+
+        stop_op = project.build_container_operation_with_timeout_func('stop', options={})
+
+        web_container = mock.create_autospec(Container, service='web')
+        db_container = mock.create_autospec(Container, service='db')
+
+        # `stop_grace_period` is not set to 'web' service,
+        # then it is stopped with the default timeout.
+        stop_op(web_container)
+        web_container.stop.assert_called_once_with(timeout=DEFAULT_TIMEOUT)
+
+        # `stop_grace_period` is set to 'db' service,
+        # then it is stopped with the specified timeout and
+        # the value is not overridden by the previous function call.
+        stop_op(db_container)
+        db_container.stop.assert_called_once_with(timeout=1)
+
     @mock.patch('compose.parallel.ParallelStreamWriter._write_noansi')
     def test_error_parallel_pull(self, mock_write):
         project = Project.from_config(
             name='test',
             client=self.mock_client,
-            config_data=Config(
-                version=V2_0,
+            config_data=build_config(
                 services=[{
                     'name': 'web',
-                    'image': 'busybox:latest',
+                    'image': BUSYBOX_IMAGE_WITH_TAG,
                 }],
                 networks=None,
                 volumes=None,
@@ -810,3 +839,84 @@ class ProjectTest(unittest.TestCase):
         with mock.patch('compose.service.Service.push') as fake_push:
             project.push()
             assert fake_push.call_count == 2
+
+    def test_get_secrets_no_secret_def(self):
+        service = 'foo'
+        secret_source = 'bar'
+
+        secret_defs = mock.Mock()
+        secret_defs.get.return_value = None
+        secret = mock.Mock(source=secret_source)
+
+        with self.assertRaises(ConfigurationError):
+            get_secrets(service, [secret], secret_defs)
+
+    def test_get_secrets_external_warning(self):
+        service = 'foo'
+        secret_source = 'bar'
+
+        secret_def = mock.Mock()
+        secret_def.get.return_value = True
+
+        secret_defs = mock.Mock()
+        secret_defs.get.side_effect = secret_def
+        secret = mock.Mock(source=secret_source)
+
+        with mock.patch('compose.project.log') as mock_log:
+            get_secrets(service, [secret], secret_defs)
+
+        mock_log.warning.assert_called_with("Service \"{service}\" uses secret \"{secret}\" "
+                                            "which is external. External secrets are not available"
+                                            " to containers created by docker-compose."
+                                            .format(service=service, secret=secret_source))
+
+    def test_get_secrets_uid_gid_mode_warning(self):
+        service = 'foo'
+        secret_source = 'bar'
+
+        fd, filename_path = tempfile.mkstemp()
+        os.close(fd)
+        self.addCleanup(os.remove, filename_path)
+
+        def mock_get(key):
+            return {'external': False, 'file': filename_path}[key]
+
+        secret_def = mock.MagicMock()
+        secret_def.get = mock.MagicMock(side_effect=mock_get)
+
+        secret_defs = mock.Mock()
+        secret_defs.get.return_value = secret_def
+
+        secret = mock.Mock(uid=True, gid=True, mode=True, source=secret_source)
+
+        with mock.patch('compose.project.log') as mock_log:
+            get_secrets(service, [secret], secret_defs)
+
+        mock_log.warning.assert_called_with("Service \"{service}\" uses secret \"{secret}\" with uid, "
+                                            "gid, or mode. These fields are not supported by this "
+                                            "implementation of the Compose file"
+                                            .format(service=service, secret=secret_source))
+
+    def test_get_secrets_secret_file_warning(self):
+        service = 'foo'
+        secret_source = 'bar'
+        not_a_path = 'NOT_A_PATH'
+
+        def mock_get(key):
+            return {'external': False, 'file': not_a_path}[key]
+
+        secret_def = mock.MagicMock()
+        secret_def.get = mock.MagicMock(side_effect=mock_get)
+
+        secret_defs = mock.Mock()
+        secret_defs.get.return_value = secret_def
+
+        secret = mock.Mock(uid=False, gid=False, mode=False, source=secret_source)
+
+        with mock.patch('compose.project.log') as mock_log:
+            get_secrets(service, [secret], secret_defs)
+
+        mock_log.warning.assert_called_with("Service \"{service}\" uses an undefined secret file "
+                                            "\"{secret_file}\", the following file should be created "
+                                            "\"{secret_file}\""
+                                            .format(service=service, secret_file=not_a_path))

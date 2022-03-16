@@ -1,6 +1,3 @@
-from __future__ import absolute_import
-from __future__ import unicode_literals
-
 import docker
 import pytest
 from docker.constants import DEFAULT_DOCKER_API_VERSION
@@ -66,9 +63,9 @@ class ServiceTest(unittest.TestCase):
         assert [c.id for c in service.containers()] == list(range(3))
 
         expected_labels = [
-            '{0}=myproject'.format(LABEL_PROJECT),
-            '{0}=db'.format(LABEL_SERVICE),
-            '{0}=False'.format(LABEL_ONE_OFF),
+            '{}=myproject'.format(LABEL_PROJECT),
+            '{}=db'.format(LABEL_SERVICE),
+            '{}=False'.format(LABEL_ONE_OFF),
         ]
 
         self.mock_client.containers.assert_called_once_with(
@@ -333,7 +330,7 @@ class ServiceTest(unittest.TestCase):
         assert service.options['environment'] == environment
 
         assert opts['labels'][LABEL_CONFIG_HASH] == \
-            '2524a06fcb3d781aa2c981fc40bcfa08013bb318e4273bfa388df22023e6f2aa'
+            '6da0f3ec0d5adf901de304bdc7e0ee44ec5dd7adb08aebc20fe0dd791d4ee5a8'
         assert opts['environment'] == ['also=real']
 
     def test_get_container_create_options_sets_affinity_with_binds(self):
@@ -516,12 +513,42 @@ class ServiceTest(unittest.TestCase):
 
         with mock.patch('compose.service.log', autospec=True) as mock_log:
             service.create_container()
-            assert mock_log.warn.called
-            _, args, _ = mock_log.warn.mock_calls[0]
+            assert mock_log.warning.called
+            _, args, _ = mock_log.warning.mock_calls[0]
             assert 'was built because it did not already exist' in args[0]
 
         assert self.mock_client.build.call_count == 1
-        self.mock_client.build.call_args[1]['tag'] == 'default_foo'
+        assert self.mock_client.build.call_args[1]['tag'] == 'default_foo'
+
+    def test_create_container_binary_string_error(self):
+        service = Service('foo', client=self.mock_client, build={'context': '.'})
+        service.image = lambda: {'Id': 'abc123'}
+
+        self.mock_client.create_container.side_effect = APIError(None,
+                                                                 None,
+                                                                 b"Test binary string explanation")
+        with pytest.raises(OperationFailedError) as ex:
+            service.create_container()
+
+        assert ex.value.msg == "Cannot create container for service foo: Test binary string explanation"
+
+    def test_start_binary_string_error(self):
+        service = Service('foo', client=self.mock_client)
+        container = Container(self.mock_client, {'Id': 'abc123'})
+
+        self.mock_client.start.side_effect = APIError(None,
+                                                      None,
+                                                      b"Test binary string explanation with "
+                                                      b"driver failed programming external "
+                                                      b"connectivity")
+        with mock.patch('compose.service.log', autospec=True) as mock_log:
+            with pytest.raises(OperationFailedError) as ex:
+                service.start_container(container)
+
+        assert ex.value.msg == "Cannot start service foo: " \
+                               "Test binary string explanation " \
+                               "with driver failed programming external connectivity"
+        mock_log.warn.assert_called_once_with("Host is already in use by another container")
 
     def test_ensure_image_exists_no_build(self):
         service = Service('foo', client=self.mock_client, build={'context': '.'})
@@ -546,7 +573,7 @@ class ServiceTest(unittest.TestCase):
         with mock.patch('compose.service.log', autospec=True) as mock_log:
             service.ensure_image_exists(do_build=BuildAction.force)
 
-        assert not mock_log.warn.called
+        assert not mock_log.warning.called
         assert self.mock_client.build.call_count == 1
         self.mock_client.build.call_args[1]['tag'] == 'default_foo'
 
@@ -673,9 +700,11 @@ class ServiceTest(unittest.TestCase):
         config_dict = service.config_dict()
         expected = {
             'image_id': 'abcd',
+            'ipc_mode': None,
             'options': {'image': 'example.com/foo'},
             'links': [('one', 'one')],
             'net': 'other',
+            'secrets': [],
             'networks': {'default': None},
             'volumes_from': [('two', 'rw')],
         }
@@ -695,9 +724,11 @@ class ServiceTest(unittest.TestCase):
         config_dict = service.config_dict()
         expected = {
             'image_id': 'abcd',
+            'ipc_mode': None,
             'options': {'image': 'example.com/foo'},
             'links': [],
             'networks': {},
+            'secrets': [],
             'net': 'aaabbb',
             'volumes_from': [],
         }
@@ -826,7 +857,7 @@ class ServiceTest(unittest.TestCase):
         assert service.specifies_host_port()
 
     def test_image_name_from_config(self):
-        image_name = 'example/web:latest'
+        image_name = 'example/web:mytag'
         service = Service('foo', image=image_name)
         assert service.image_name == image_name
 
@@ -845,13 +876,13 @@ class ServiceTest(unittest.TestCase):
             ports=["8080:80"])
 
         service.scale(0)
-        assert not mock_log.warn.called
+        assert not mock_log.warning.called
 
         service.scale(1)
-        assert not mock_log.warn.called
+        assert not mock_log.warning.called
 
         service.scale(2)
-        mock_log.warn.assert_called_once_with(
+        mock_log.warning.assert_called_once_with(
             'The "{}" service specifies a port on the host. If multiple containers '
             'for this service are created on a single host, the port will clash.'.format(name))
 
@@ -1332,10 +1363,8 @@ class ServiceVolumesTest(unittest.TestCase):
             number=1,
         )
 
-        assert set(self.mock_client.create_host_config.call_args[1]['binds']) == set([
-            '/host/path:/data1:rw',
-            '/host/path:/data2:rw',
-        ])
+        assert set(self.mock_client.create_host_config.call_args[1]['binds']) == {'/host/path:/data1:rw',
+                                                                                  '/host/path:/data2:rw'}
 
     def test_get_container_create_options_with_different_host_path_in_container_json(self):
         service = Service(
@@ -1389,7 +1418,7 @@ class ServiceVolumesTest(unittest.TestCase):
         with mock.patch('compose.service.log', autospec=True) as mock_log:
             warn_on_masked_volume(volumes_option, container_volumes, service)
 
-        assert not mock_log.warn.called
+        assert not mock_log.warning.called
 
     def test_warn_on_masked_volume_when_masked(self):
         volumes_option = [VolumeSpec('/home/user', '/path', 'rw')]
@@ -1402,7 +1431,7 @@ class ServiceVolumesTest(unittest.TestCase):
         with mock.patch('compose.service.log', autospec=True) as mock_log:
             warn_on_masked_volume(volumes_option, container_volumes, service)
 
-        mock_log.warn.assert_called_once_with(mock.ANY)
+        mock_log.warning.assert_called_once_with(mock.ANY)
 
     def test_warn_on_masked_no_warning_with_same_path(self):
         volumes_option = [VolumeSpec('/home/user', '/path', 'rw')]
@@ -1412,7 +1441,7 @@ class ServiceVolumesTest(unittest.TestCase):
         with mock.patch('compose.service.log', autospec=True) as mock_log:
             warn_on_masked_volume(volumes_option, container_volumes, service)
 
-        assert not mock_log.warn.called
+        assert not mock_log.warning.called
 
     def test_warn_on_masked_no_warning_with_container_only_option(self):
         volumes_option = [VolumeSpec(None, '/path', 'rw')]
@@ -1424,7 +1453,7 @@ class ServiceVolumesTest(unittest.TestCase):
         with mock.patch('compose.service.log', autospec=True) as mock_log:
             warn_on_masked_volume(volumes_option, container_volumes, service)
 
-        assert not mock_log.warn.called
+        assert not mock_log.warning.called
 
     def test_create_with_special_volume_mode(self):
         self.mock_client.inspect_image.return_value = {'Id': 'imageid'}

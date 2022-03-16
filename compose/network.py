@@ -1,9 +1,7 @@
-from __future__ import absolute_import
-from __future__ import unicode_literals
-
 import logging
 import re
 from collections import OrderedDict
+from operator import itemgetter
 
 from docker.errors import NotFound
 from docker.types import IPAMConfig
@@ -27,7 +25,7 @@ OPTS_EXCEPTIONS = [
 ]
 
 
-class Network(object):
+class Network:
     def __init__(self, client, project, name, driver=None, driver_opts=None,
                  ipam=None, external=False, internal=False, enable_ipv6=False,
                  labels=None, custom_name=False):
@@ -54,7 +52,7 @@ class Network(object):
             try:
                 self.inspect()
                 log.debug(
-                    'Network {0} declared as external. No new '
+                    'Network {} declared as external. No new '
                     'network will be created.'.format(self.name)
                 )
             except NotFound:
@@ -110,7 +108,7 @@ class Network(object):
     def legacy_full_name(self):
         if self.custom_name:
             return self.name
-        return '{0}_{1}'.format(
+        return '{}_{}'.format(
             re.sub(r'[_-]', '', self.project), self.name
         )
 
@@ -118,7 +116,7 @@ class Network(object):
     def full_name(self):
         if self.custom_name:
             return self.name
-        return '{0}_{1}'.format(self.project, self.name)
+        return '{}_{}'.format(self.project, self.name)
 
     @property
     def true_name(self):
@@ -170,7 +168,7 @@ def create_ipam_config_from_dict(ipam_dict):
 
 class NetworkConfigChangedError(ConfigurationError):
     def __init__(self, net_name, property_name):
-        super(NetworkConfigChangedError, self).__init__(
+        super().__init__(
             'Network "{}" needs to be recreated - {} has changed'.format(
                 net_name, property_name
             )
@@ -226,12 +224,12 @@ def check_remote_network_config(remote, local):
         raise NetworkConfigChangedError(local.true_name, 'enable_ipv6')
 
     local_labels = local.labels or {}
-    remote_labels = remote.get('Labels', {})
+    remote_labels = remote.get('Labels') or {}
     for k in set.union(set(remote_labels.keys()), set(local_labels.keys())):
         if k.startswith('com.docker.'):  # We are only interested in user-specified labels
             continue
         if remote_labels.get(k) != local_labels.get(k):
-            log.warn(
+            log.warning(
                 'Network {}: label "{}" has changed. It may need to be'
                 ' recreated.'.format(local.true_name, k)
             )
@@ -261,7 +259,7 @@ def build_networks(name, config_data, client):
     return networks
 
 
-class ProjectNetworks(object):
+class ProjectNetworks:
 
     def __init__(self, networks, use_networking):
         self.networks = networks or {}
@@ -276,7 +274,7 @@ class ProjectNetworks(object):
         }
         unused = set(networks) - set(service_networks) - {'default'}
         if unused:
-            log.warn(
+            log.warning(
                 "Some networks were defined but are not used by any service: "
                 "{}".format(", ".join(unused)))
         return cls(service_networks, use_networking)
@@ -288,7 +286,7 @@ class ProjectNetworks(object):
             try:
                 network.remove()
             except NotFound:
-                log.warn("Network %s not found.", network.true_name)
+                log.warning("Network %s not found.", network.true_name)
 
     def initialize(self):
         if not self.use_networking:
@@ -302,10 +300,10 @@ def get_network_defs_for_service(service_dict):
     if 'network_mode' in service_dict:
         return {}
     networks = service_dict.get('networks', {'default': None})
-    return dict(
-        (net, (config or {}))
+    return {
+        net: (config or {})
         for net, config in networks.items()
-    )
+    }
 
 
 def get_network_names_for_service(service_dict):
@@ -331,4 +329,4 @@ def get_networks(service_dict, network_definitions):
     else:
         # Ensure Compose will pick a consistent primary network if no
         # priority is set
-        return OrderedDict(sorted(networks.items(), key=lambda t: t[0]))
+        return OrderedDict(sorted(networks.items(), key=itemgetter(0)))

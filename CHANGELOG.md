@@ -1,6 +1,593 @@
 Change log
 ==========
 
+1.29.2 (2021-05-10)
+-------------------
+
+[List of PRs / issues for this release](https://github.com/docker/compose/milestone/59?closed=1)
+
+### Miscellaneous
+
+- Remove prompt to use `docker compose` in the `up` command
+
+- Bump `py` to `1.10.0` in `requirements-indirect.txt`
+
+1.29.1 (2021-04-13)
+-------------------
+
+[List of PRs / issues for this release](https://github.com/docker/compose/milestone/58?closed=1)
+
+### Bugs
+
+- Fix for invalid handler warning on Windows builds
+
+- Fix config hash to trigger container recreation on IPC mode updates
+
+- Fix conversion map for `placement.max_replicas_per_node`
+
+- Remove extra scan suggestion on build
+
+1.29.0 (2021-04-06)
+-------------------
+
+[List of PRs / issues for this release](https://github.com/docker/compose/milestone/56?closed=1)
+
+### Features
+
+- Add profile filter to `docker-compose config`
+
+- Add a `depends_on` condition to wait for successful service completion
+
+### Miscellaneous
+
+- Add image scan message on build
+
+- Update warning message for `--no-ansi` to mention `--ansi never` as alternative
+
+- Bump docker-py to 5.0.0
+
+- Bump PyYAML to 5.4.1
+
+- Bump python-dotenv to 0.17.0
+
+1.28.6 (2021-03-23)
+-------------------
+
+[List of PRs / issues for this release](https://github.com/docker/compose/milestone/57?closed=1)
+
+### Bugs
+
+- Make `--env-file` relative to the current working directory and error out for invalid paths. Environment file paths set with `--env-file` are relative to the current working directory while the default `.env` file is located in the project directory which by default is the base directory of the Compose file.
+
+- Fix missing service property `storage_opt` by updating the compose schema
+
+- Fix build `extra_hosts` list format
+
+- Remove extra error message on `exec`
+
+### Miscellaneous
+
+- Add `compose.yml` and `compose.yaml` to default filename list
+
+1.28.5 (2021-02-25)
+-------------------
+
+[List of PRs / issues for this release](https://github.com/docker/compose/milestone/55?closed=1)
+
+### Bugs
+
+- Fix OpenSSL version mismatch error when shelling out to the ssh client (via bump to docker-py 4.4.4 which contains the fix)
+
+- Add missing build flags to the native builder: `platform`, `isolation` and `extra_hosts`
+
+- Remove info message on native build
+
+- Avoid fetching logs when service logging driver is set to 'none'
+
+1.28.4 (2021-02-18)
+-------------------
+
+[List of PRs / issues for this release](https://github.com/docker/compose/milestone/54?closed=1)
+
+### Bugs
+
+- Fix SSH port parsing by bumping docker-py to 4.4.3
+
+### Miscellaneous
+
+- Bump Python to 3.7.10
+
+1.28.3 (2021-02-17)
+-------------------
+
+[List of PRs / issues for this release](https://github.com/docker/compose/milestone/53?closed=1)
+
+### Bugs
+
+- Fix SSH hostname parsing when it contains leading s/h, and remove the quiet option that was hiding the error (via docker-py bump to 4.4.2)
+
+- Fix key error for '--no-log-prefix' option
+
+- Fix incorrect CLI environment variable name for service profiles: `COMPOSE_PROFILES` instead of `COMPOSE_PROFILE`
+
+- Fix fish completion
+
+### Miscellaneous
+
+- Bump cryptography to 3.3.2
+
+- Remove log driver filter
+
+1.28.2 (2021-01-26)
+-------------------
+
+### Miscellaneous
+
+- CI setup update
+
+1.28.1 (2021-01-25)
+-------------------
+
+### Bugs
+
+- Revert to Python 3.7 bump for Linux static builds
+
+- Add bash completion for `docker-compose logs|up --no-log-prefix`
+
+1.28.0 (2021-01-20)
+-------------------
+
+### Features
+
+- Support for Nvidia GPUs via device requests
+
+- Support for service profiles
+
+- Change the SSH connection approach to the Docker CLI's via shellout to the local SSH client (old behaviour enabled by setting `COMPOSE_PARAMIKO_SSH` environment variable)
+
+- Add flag to disable log prefix
+
+- Add flag for ansi output control
+
+### Bugs
+
+- Make `parallel_pull=True` by default
+
+- Bring back warning for configs in non-swarm mode
+
+- Take `--file` in account when defining `project_dir`
+
+- On `compose up`, attach only to services we read logs from
+
+### Miscellaneous
+
+- Make COMPOSE_DOCKER_CLI_BUILD=1 the default
+
+- Add usage metrics
+
+- Sync schema with COMPOSE specification
+
+- Improve failure report for missing mandatory environment variables
+
+- Bump attrs to 20.3.0
+
+- Bump more_itertools to 8.6.0
+
+- Bump cryptograhy to 3.2.1
+
+- Bump cffi to 1.14.4
+
+- Bump virtualenv to 20.2.2
+
+- Bump bcrypt to 3.2.0
+
+- Bump gitpython to 3.1.11
+
+- Bump docker-py to 4.4.1
+
+- Bump Python to 3.9
+
+- Linux: bump Debian base image from stretch to buster (required for Python 3.9)
+
+- macOS: OpenSSL 1.1.1g to 1.1.1h, Python 3.7.7 to 3.9.0
+
+- Bump pyinstaller 4.1
+
+- Loosen restriction on base images to latest minor
+
+- Updates of READMEs
+
+
+1.27.4 (2020-09-24)
+-------------------
+
+### Bugs
+
+- Remove path checks for bind mounts
+
+- Fix port rendering to output long form syntax for non-v1
+
+- Add protocol to the docker socket address
+
+1.27.3 (2020-09-16)
+-------------------
+
+### Bugs
+
+- Merge `max_replicas_per_node` on `docker-compose config`
+
+- Fix `depends_on` serialization on `docker-compose config`
+
+- Fix scaling when some containers are not running on `docker-compose up`
+
+- Enable relative paths for `driver_opts.device` for `local` driver
+
+- Allow strings for `cpus` fields
+
+1.27.2 (2020-09-10)
+-------------------
+
+### Bugs
+
+- Fix bug on `docker-compose run` container attach
+
+1.27.1 (2020-09-10)
+-------------------
+
+### Bugs
+
+- Fix `docker-compose run` when `service.scale` is specified
+
+- Allow `driver` property for external networks as temporary workaround for swarm network propagation issue
+
+- Pin new internal schema version to `3.9` as the default
+
+- Preserve the version when configured in the compose file
+
+1.27.0 (2020-09-07)
+-------------------
+
+### Features
+
+- Merge 2.x and 3.x compose formats and align with COMPOSE_SPEC schema
+
+- Implement service mode for ipc
+
+- Pass `COMPOSE_PROJECT_NAME` environment variable in container mode
+
+- Make run behave in the same way as up
+
+- Use `docker build` on `docker-compose run` when `COMPOSE_DOCKER_CLI_BUILD` environment variable is set
+
+- Use docker-py default API version for engine queries (`auto`)
+
+- Parse `network_mode` on build
+
+### Bugs
+
+- Ignore build context path validation when building is not required
+
+- Fix float to bytes conversion via docker-py bump to 4.3.1
+
+- Fix scale bug when deploy section is set
+
+- Fix `docker-py` bump in `setup.py`
+
+- Fix experimental build failure detection
+
+- Fix context propagation to docker cli
+
+### Miscellaneous
+
+- Drop support for Python 2.7
+
+- Bump `docker-py` to 4.3.1
+
+- Bump `tox` to 3.19.0
+
+- Bump `virtualenv` to 20.0.30
+
+- Add script for docs syncronization
+
+1.26.2 (2020-07-02)
+-------------------
+
+### Bugs
+
+- Enforce `docker-py` 4.2.2 as minimum version when installing with pip
+
+1.26.1 (2020-06-30)
+-------------------
+
+### Features
+
+- Bump `docker-py` from 4.2.1 to 4.2.2
+
+### Bugs
+
+- Enforce `docker-py` 4.2.1 as minimum version when installing with pip
+
+- Fix context load for non-docker endpoints
+
+1.26.0 (2020-06-03)
+-------------------
+
+### Features
+
+- Add `docker context` support
+
+- Add missing test dependency `ddt` to `setup.py`
+
+- Add `--attach-dependencies` to command `up` for attaching to dependencies
+
+- Allow compatibility option with `COMPOSE_COMPATIBILITY` environment variable
+
+- Bump `Pytest` to 5.3.4 and add refactor compatibility with new version
+
+- Bump `OpenSSL` from 1.1.1f to 1.1.1g
+
+- Bump `docker-py` from 4.2.0 to 4.2.1
+
+### Bugs
+
+- Properly escape values coming from env_files
+
+- Sync compose-schemas with upstream (docker/cli)
+
+- Remove `None` entries on exec command
+
+- Add `python-dotenv` to delegate `.env` file processing
+
+- Don't adjust output on terminal width when piped into another command
+
+- Show an error message when `version` attribute is malformed
+
+- Fix HTTPS connection when DOCKER_HOST is remote
+
+1.25.5 (2020-02-04)
+-------------------
+
+### Features
+
+- Bump OpenSSL from 1.1.1d to 1.1.1f
+
+- Add 3.8 compose version
+
+1.25.4 (2020-01-23)
+-------------------
+
+### Bugfixes
+
+- Fix CI script to enforce the minimal MacOS version to 10.11
+
+- Fix docker-compose exec for keys with no value
+
+1.25.3 (2020-01-23)
+-------------------
+
+### Bugfixes
+
+- Fix CI script to enforce the compilation with Python3
+
+- Fix binary's sha256 in the release page
+
+1.25.2 (2020-01-20)
+-------------------
+
+### Features
+
+- Allow compatibility option with `COMPOSE_COMPATIBILITY` environment variable
+
+- Bump PyInstaller from 3.5 to 3.6
+
+- Bump pysocks from 1.6.7 to 1.7.1
+
+- Bump websocket-client from 0.32.0 to 0.57.0
+
+- Bump urllib3 from 1.24.2 to 1.25.7
+
+- Bump jsonschema from 3.0.1 to 3.2.0
+
+- Bump PyYAML from 4.2b1 to 5.3
+
+- Bump certifi from 2017.4.17 to 2019.11.28
+
+- Bump coverage from 4.5.4 to 5.0.3
+
+- Bump paramiko from 2.6.0 to 2.7.1
+
+- Bump cached-property from 1.3.0 to 1.5.1
+
+- Bump minor Linux and MacOSX dependencies
+
+### Bugfixes
+
+- Validate version format on formats 2+
+
+- Assume infinite terminal width when not running in a terminal
+
+1.25.1 (2020-01-06)
+-------------------
+
+### Features
+
+- Bump `pytest-cov` 2.8.1
+
+- Bump `flake8` 3.7.9
+
+- Bump `coverage` 4.5.4
+
+### Bugfixes
+
+- Decode APIError explanation to unicode before usage on start and create of a container
+
+- Reports when images that cannot be pulled and must be built
+
+- Discard label `com.docker.compose.filepaths` having None as value. Typically, when coming from stdin
+
+- Added OSX binary as a directory to solve slow start up time caused by MacOS Catalina binary scan
+
+- Passed in HOME env-var in container mode (running with `script/run/run.sh`)
+
+- Reverted behavior of "only pull images that we can't build" and replace by a warning informing the image we can't pull and must be built
+
+
+1.25.0 (2019-11-18)
+-------------------
+
+### Features
+
+- Set no-colors to true if CLICOLOR env variable is set to 0
+
+- Add working dir, config files and env file in service labels
+
+- Add dependencies for ARM build
+
+- Add BuildKit support, use `DOCKER_BUILDKIT=1` and `COMPOSE_DOCKER_CLI_BUILD=1`
+
+- Bump paramiko to 2.6.0
+
+- Add working dir, config files and env file in service labels
+
+- Add tag `docker-compose:latest`
+
+- Add `docker-compose:<version>-alpine` image/tag
+
+- Add `docker-compose:<version>-debian` image/tag
+
+- Bumped `docker-py` 4.1.0
+
+- Supports `requests` up to 2.22.0 version
+
+- Drops empty tag on `build:cache_from`
+
+- `Dockerfile` now generates `libmusl` binaries for alpine
+
+- Only pull images that can't be built
+
+- Attribute `scale` can now accept `0` as a value
+
+- Added `--quiet` build flag
+
+- Added `--no-interpolate` to `docker-compose config`
+
+- Bump OpenSSL for macOS build (`1.1.0j` to `1.1.1c`)
+
+- Added `--no-rm` to `build` command
+
+- Added support for `credential_spec`
+
+- Resolve digests without pulling image
+
+- Upgrade `pyyaml` to `4.2b1`
+
+- Lowered severity to `warning` if `down` tries to remove nonexisting image
+
+- Use improved API fields for project events when possible
+
+- Update `setup.py` for modern `pypi/setuptools` and remove `pandoc` dependencies
+
+- Removed `Dockerfile.armhf` which is no longer needed
+
+### Bugfixes
+
+- Make container service color deterministic, remove red from chosen colors
+
+- Fix non ascii chars error. Python2 only
+
+- Format image size as decimal to be align with Docker CLI
+
+- Use Python Posix support to get tty size
+
+- Fix same file 'extends' optimization
+
+- Use python POSIX support to get tty size
+
+- Format image size as decimal to be align with Docker CLI
+
+- Fixed stdin_open
+
+- Fixed `--remove-orphans` when used with `up --no-start`
+
+- Fixed `docker-compose ps --all`
+
+- Fixed `depends_on` dependency recreation behavior
+
+- Fixed bash completion for `build --memory`
+
+- Fixed misleading warning concerning env vars when performing an `exec` command
+
+- Fixed failure check in parallel_execute_watch
+
+- Fixed race condition after pulling image
+
+- Fixed error on duplicate mount points
+
+- Fixed merge on networks section
+
+- Always connect Compose container to `stdin`
+
+- Fixed the presentation of failed services on 'docker-compose start' when containers are not available
+
+1.24.1 (2019-06-24)
+-------------------
+
+### Bugfixes
+
+- Fixed acceptance tests
+
+1.24.0 (2019-03-28)
+-------------------
+
+### Features
+
+- Added support for connecting to the Docker Engine using the `ssh` protocol.
+
+- Added a `--all` flag to `docker-compose ps` to include stopped one-off containers
+  in the command's output.
+
+- Add bash completion for `ps --all|-a`
+
+- Support for credential_spec
+
+- Add `--parallel` to `docker build`'s options in `bash` and `zsh` completion
+
+### Bugfixes
+
+- Fixed a bug where some valid credential helpers weren't properly handled by Compose
+  when attempting to pull images from private registries.
+
+- Fixed an issue where the output of `docker-compose start` before containers were created
+  was misleading
+
+- To match the Docker CLI behavior and to avoid confusing issues, Compose will no longer
+  accept whitespace in variable names sourced from environment files.
+
+- Compose will now report a configuration error if a service attempts to declare
+  duplicate mount points in the volumes section.
+
+- Fixed an issue with the containerized version of Compose that prevented users from
+  writing to stdin during interactive sessions started by `run` or `exec`.
+
+- One-off containers started by `run` no longer adopt the restart policy of the service,
+  and are instead set to never restart.
+
+- Fixed an issue that caused some container events to not appear in the output of
+  the `docker-compose events` command.
+
+- Missing images will no longer stop the execution of `docker-compose down` commands
+  (a warning will be displayed instead).
+
+- Force `virtualenv` version for macOS CI
+
+- Fix merging of compose files when network has `None` config
+
+- Fix `CTRL+C` issues by enabling `bootloader_ignore_signals` in `pyinstaller`
+
+- Bump `docker-py` version to `3.7.2` to fix SSH and proxy config issues
+
+- Fix release script and some typos on release documentation
+
 1.23.2 (2018-11-28)
 -------------------
 
