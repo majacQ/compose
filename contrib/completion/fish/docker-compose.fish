@@ -12,6 +12,7 @@ end
 
 complete -c docker-compose -s f -l file -r                -d 'Specify an alternate compose file'
 complete -c docker-compose -s p -l project-name -x        -d 'Specify an alternate project name'
+complete -c docker-compose -l env-file -r                 -d 'Specify an alternate environment file (default: .env)'
 complete -c docker-compose -l verbose                     -d 'Show more output'
 complete -c docker-compose -s H -l host -x                -d 'Daemon socket to connect to'
 complete -c docker-compose -l tls                         -d 'Use TLS; implied by --tlsverify'
@@ -20,5 +21,7 @@ complete -c docker-compose -l tlscert -r                  -d 'Path to TLS certif
 complete -c docker-compose -l tlskey -r                   -d 'Path to TLS key file'
 complete -c docker-compose -l tlsverify                   -d 'Use TLS and verify the remote'
 complete -c docker-compose -l skip-hostname-check         -d "Don't check the daemon's hostname against the name specified in the client certificate (for example if your docker host is an IP address)"
+complete -c docker-compose -l no-ansi                     -d 'Do not print ANSI control characters'
+complete -c docker-compose -l ansi -a 'never always auto' -d 'Control when to print ANSI control characters'
 complete -c docker-compose -s h -l help                   -d 'Print usage'
 complete -c docker-compose -s v -l version                -d 'Print version and exit'

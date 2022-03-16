@@ -15,16 +15,16 @@
 
 set -e
 
-VERSION="1.23.2"
+VERSION="1.26.1"
 IMAGE="docker/compose:$VERSION"
 
 
 # Setup options for connecting to docker host
 if [ -z "$DOCKER_HOST" ]; then
-    DOCKER_HOST="/var/run/docker.sock"
+    DOCKER_HOST='unix:///var/run/docker.sock'
 fi
-if [ -S "$DOCKER_HOST" ]; then
-    DOCKER_ADDR="-v $DOCKER_HOST:$DOCKER_HOST -e DOCKER_HOST"
+if [ -S "${DOCKER_HOST#unix://}" ]; then
+    DOCKER_ADDR="-v ${DOCKER_HOST#unix://}:${DOCKER_HOST#unix://} -e DOCKER_HOST"
 else
     DOCKER_ADDR="-e DOCKER_HOST -e DOCKER_TLS_VERIFY -e DOCKER_CERT_PATH"
 fi
@@ -36,19 +36,46 @@ if [ "$(pwd)" != '/' ]; then
 fi
 if [ -n "$COMPOSE_FILE" ]; then
     COMPOSE_OPTIONS="$COMPOSE_OPTIONS -e COMPOSE_FILE=$COMPOSE_FILE"
-    compose_dir=$(realpath $(dirname $COMPOSE_FILE))
+    compose_dir="$(dirname "$COMPOSE_FILE")"
+    # canonicalize dir, do not use realpath or readlink -f
+    # since they are not available in some systems (e.g. macOS).
+    compose_dir="$(cd "$compose_dir" && pwd)"
 fi
-# TODO: also check --file argument
+if [ -n "$COMPOSE_PROJECT_NAME" ]; then
+    COMPOSE_OPTIONS="-e COMPOSE_PROJECT_NAME $COMPOSE_OPTIONS"
+fi
 if [ -n "$compose_dir" ]; then
     VOLUMES="$VOLUMES -v $compose_dir:$compose_dir"
 fi
 if [ -n "$HOME" ]; then
-    VOLUMES="$VOLUMES -v $HOME:$HOME -v $HOME:/root" # mount $HOME in /root to share docker.config
+    VOLUMES="$VOLUMES -v $HOME:$HOME -e HOME" # Pass in HOME to share docker.config and allow ~/-relative paths to work.
 fi
+i=$#
+while [ $i -gt 0 ]; do
+    arg=$1
+    i=$((i - 1))
+    shift
+
+    case "$arg" in
+        -f|--file)
+            value=$1
+            i=$((i - 1))
+            shift
+            set -- "$@" "$arg" "$value"
+
+            file_dir=$(realpath "$(dirname "$value")")
+            VOLUMES="$VOLUMES -v $file_dir:$file_dir"
+        ;;
+        *) set -- "$@" "$arg" ;;
+    esac
+done
+
+# Setup environment variables for compose config and context
+ENV_OPTIONS=$(printenv | sed -E "/^PATH=.*/d; s/^/-e /g; s/=.*//g; s/\n/ /g")
 
 # Only allocate tty if we detect one
-if [ -t 0 -a -t 1 ]; then
-        DOCKER_RUN_OPTIONS="$DOCKER_RUN_OPTIONS -t"
+if [ -t 0 ] && [ -t 1 ]; then
+    DOCKER_RUN_OPTIONS="$DOCKER_RUN_OPTIONS -t"
 fi
 
 # Always set -i to support piped and terminal input in run/exec
@@ -56,8 +83,9 @@ DOCKER_RUN_OPTIONS="$DOCKER_RUN_OPTIONS -i"
 
 
 # Handle userns security
-if [ ! -z "$(docker info 2>/dev/null | grep userns)" ]; then
+if docker info --format '{{json .SecurityOptions}}' 2>/dev/null | grep -q 'name=userns'; then
     DOCKER_RUN_OPTIONS="$DOCKER_RUN_OPTIONS --userns=host"
 fi
 
-exec docker run --rm $DOCKER_RUN_OPTIONS $DOCKER_ADDR $COMPOSE_OPTIONS $VOLUMES -w "$(pwd)" $IMAGE "$@"
+# shellcheck disable=SC2086
+exec docker run --rm $DOCKER_RUN_OPTIONS $DOCKER_ADDR $COMPOSE_OPTIONS $ENV_OPTIONS $VOLUMES -w "$(pwd)" $IMAGE "$@"

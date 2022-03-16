@@ -1,6 +1,3 @@
-from __future__ import absolute_import
-from __future__ import unicode_literals
-
 import functools
 import os
 
@@ -9,18 +6,13 @@ from docker.errors import APIError
 from docker.utils import version_lt
 
 from .. import unittest
+from ..helpers import BUSYBOX_IMAGE_WITH_TAG
 from compose.cli.docker_client import docker_client
 from compose.config.config import resolve_environment
 from compose.config.environment import Environment
 from compose.const import API_VERSIONS
+from compose.const import COMPOSE_SPEC as VERSION
 from compose.const import COMPOSEFILE_V1 as V1
-from compose.const import COMPOSEFILE_V2_0 as V2_0
-from compose.const import COMPOSEFILE_V2_0 as V2_1
-from compose.const import COMPOSEFILE_V2_2 as V2_2
-from compose.const import COMPOSEFILE_V2_3 as V2_3
-from compose.const import COMPOSEFILE_V3_0 as V3_0
-from compose.const import COMPOSEFILE_V3_2 as V3_2
-from compose.const import COMPOSEFILE_V3_5 as V3_5
 from compose.const import LABEL_PROJECT
 from compose.progress_stream import stream_output
 from compose.service import Service
@@ -32,7 +24,7 @@ SWARM_ASSUME_MULTINODE = os.environ.get('SWARM_ASSUME_MULTINODE', '0') != '0'
 
 
 def pull_busybox(client):
-    client.pull('busybox:latest', stream=False)
+    client.pull(BUSYBOX_IMAGE_WITH_TAG, stream=False)
 
 
 def get_links(container):
@@ -47,17 +39,11 @@ def get_links(container):
 
 def engine_max_version():
     if 'DOCKER_VERSION' not in os.environ:
-        return V3_5
+        return VERSION
     version = os.environ['DOCKER_VERSION'].partition('-')[0]
     if version_lt(version, '1.10'):
         return V1
-    if version_lt(version, '1.12'):
-        return V2_0
-    if version_lt(version, '1.13'):
-        return V2_1
-    if version_lt(version, '17.06'):
-        return V3_2
-    return V3_5
+    return VERSION
 
 
 def min_version_skip(version):
@@ -65,26 +51,6 @@ def min_version_skip(version):
         engine_max_version() < version,
         reason="Engine version %s is too low" % version
     )
-
-
-def v2_only():
-    return min_version_skip(V2_0)
-
-
-def v2_1_only():
-    return min_version_skip(V2_1)
-
-
-def v2_2_only():
-    return min_version_skip(V2_2)
-
-
-def v2_3_only():
-    return min_version_skip(V2_3)
-
-
-def v3_only():
-    return min_version_skip(V3_0)
 
 
 class DockerClientTestCase(unittest.TestCase):
@@ -95,6 +61,7 @@ class DockerClientTestCase(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.client.close()
         del cls.client
 
     def tearDown(self):
@@ -123,7 +90,7 @@ class DockerClientTestCase(unittest.TestCase):
 
     def create_service(self, name, **kwargs):
         if 'image' not in kwargs and 'build' not in kwargs:
-            kwargs['image'] = 'busybox:latest'
+            kwargs['image'] = BUSYBOX_IMAGE_WITH_TAG
 
         if 'command' not in kwargs:
             kwargs['command'] = ["top"]

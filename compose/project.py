@@ -1,18 +1,18 @@
-from __future__ import absolute_import
-from __future__ import unicode_literals
-
 import datetime
+import enum
 import logging
 import operator
 import re
 from functools import reduce
+from os import path
 
-import enum
-import six
 from docker.errors import APIError
+from docker.errors import ImageNotFound
+from docker.errors import NotFound
 from docker.utils import version_lt
 
 from . import parallel
+from .cli.errors import UserError
 from .config import ConfigurationError
 from .config.config import V1
 from .config.sort_services import get_container_name_from_network_mode
@@ -24,20 +24,25 @@ from .container import Container
 from .network import build_networks
 from .network import get_networks
 from .network import ProjectNetworks
+from .progress_stream import read_status
 from .service import BuildAction
+from .service import ContainerIpcMode
 from .service import ContainerNetworkMode
 from .service import ContainerPidMode
 from .service import ConvergenceStrategy
+from .service import IpcMode
 from .service import NetworkMode
+from .service import NoSuchImageError
 from .service import parse_repository_tag
 from .service import PidMode
 from .service import Service
+from .service import ServiceIpcMode
 from .service import ServiceNetworkMode
 from .service import ServicePidMode
+from .utils import filter_attached_for_up
 from .utils import microseconds_from_time_nano
 from .utils import truncate_string
 from .volume import ProjectVolumes
-
 
 log = logging.getLogger(__name__)
 
@@ -51,41 +56,45 @@ class OneOffFilter(enum.Enum):
     @classmethod
     def update_labels(cls, value, labels):
         if value == cls.only:
-            labels.append('{0}={1}'.format(LABEL_ONE_OFF, "True"))
+            labels.append('{}={}'.format(LABEL_ONE_OFF, "True"))
         elif value == cls.exclude:
-            labels.append('{0}={1}'.format(LABEL_ONE_OFF, "False"))
+            labels.append('{}={}'.format(LABEL_ONE_OFF, "False"))
         elif value == cls.include:
             pass
         else:
             raise ValueError("Invalid value for one_off: {}".format(repr(value)))
 
 
-class Project(object):
+class Project:
     """
     A collection of services.
     """
-    def __init__(self, name, services, client, networks=None, volumes=None, config_version=None):
+    def __init__(self, name, services, client, networks=None, volumes=None, config_version=None,
+                 enabled_profiles=None):
         self.name = name
         self.services = services
         self.client = client
         self.volumes = volumes or ProjectVolumes({})
         self.networks = networks or ProjectNetworks({}, False)
         self.config_version = config_version
+        self.enabled_profiles = enabled_profiles or []
 
     def labels(self, one_off=OneOffFilter.exclude, legacy=False):
         name = self.name
         if legacy:
             name = re.sub(r'[_-]', '', name)
-        labels = ['{0}={1}'.format(LABEL_PROJECT, name)]
+        labels = ['{}={}'.format(LABEL_PROJECT, name)]
 
         OneOffFilter.update_labels(one_off, labels)
         return labels
 
     @classmethod
-    def from_config(cls, name, config_data, client, default_platform=None):
+    def from_config(cls, name, config_data, client, default_platform=None, extra_labels=None,
+                    enabled_profiles=None):
         """
         Construct a Project from a config.Config object.
         """
+        extra_labels = extra_labels or []
         use_networking = (config_data.version and config_data.version != V1)
         networks = build_networks(name, config_data, client)
         project_networks = ProjectNetworks.from_services(
@@ -93,7 +102,7 @@ class Project(object):
             networks,
             use_networking)
         volumes = ProjectVolumes.from_config(name, config_data, client)
-        project = cls(name, [], client, project_networks, volumes, config_data.version)
+        project = cls(name, [], client, project_networks, volumes, config_data.version, enabled_profiles)
 
         for service_dict in config_data.services:
             service_dict = dict(service_dict)
@@ -104,6 +113,7 @@ class Project(object):
 
             service_dict.pop('networks', None)
             links = project.get_links(service_dict)
+            ipc_mode = project.get_ipc_mode(service_dict)
             network_mode = project.get_network_mode(
                 service_dict, list(service_networks.keys())
             )
@@ -121,6 +131,18 @@ class Project(object):
                 service_dict.pop('secrets', None) or [],
                 config_data.secrets)
 
+            service_dict['scale'] = project.get_service_scale(service_dict)
+            service_dict['device_requests'] = project.get_device_requests(service_dict)
+            service_dict = translate_credential_spec_to_security_opt(service_dict)
+            service_dict, ignored_keys = translate_deploy_keys_to_container_config(
+                service_dict
+            )
+            if ignored_keys:
+                log.warning(
+                    'The following deploy sub-keys are not supported and have'
+                    ' been ignored: {}'.format(', '.join(ignored_keys))
+                )
+
             project.services.append(
                 Service(
                     service_dict.pop('name'),
@@ -133,8 +155,10 @@ class Project(object):
                     volumes_from=volumes_from,
                     secrets=secrets,
                     pid_mode=pid_mode,
+                    ipc_mode=ipc_mode,
                     platform=service_dict.pop('platform', None),
                     default_platform=default_platform,
+                    extra_labels=extra_labels,
                     **service_dict)
             )
 
@@ -165,7 +189,7 @@ class Project(object):
             if name not in valid_names:
                 raise NoSuchService(name)
 
-    def get_services(self, service_names=None, include_deps=False):
+    def get_services(self, service_names=None, include_deps=False, auto_enable_profiles=True):
         """
         Returns a list of this project's services filtered
         by the provided list of names, or all services if service_names is None
@@ -178,15 +202,36 @@ class Project(object):
         reordering as needed to resolve dependencies.
 
         Raises NoSuchService if any of the named services do not exist.
+
+        Raises ConfigurationError if any service depended on is not enabled by active profiles
         """
+        # create a copy so we can *locally* add auto-enabled profiles later
+        enabled_profiles = self.enabled_profiles.copy()
+
         if service_names is None or len(service_names) == 0:
-            service_names = self.service_names
+            auto_enable_profiles = False
+            service_names = [
+                service.name
+                for service in self.services
+                if service.enabled_for_profiles(enabled_profiles)
+            ]
 
         unsorted = [self.get_service(name) for name in service_names]
         services = [s for s in self.services if s in unsorted]
 
+        if auto_enable_profiles:
+            # enable profiles of explicitly targeted services
+            for service in services:
+                for profile in service.get_profiles():
+                    if profile not in enabled_profiles:
+                        enabled_profiles.append(profile)
+
         if include_deps:
-            services = reduce(self._inject_deps, services, [])
+            services = reduce(
+                lambda acc, s: self._inject_deps(acc, s, enabled_profiles),
+                services,
+                []
+            )
 
         uniques = []
         [uniques.append(s) for s in services if s not in uniques]
@@ -258,6 +303,83 @@ class Project(object):
                 )
 
         return PidMode(pid_mode)
+
+    def get_ipc_mode(self, service_dict):
+        ipc_mode = service_dict.pop('ipc', None)
+        if not ipc_mode:
+            return IpcMode(None)
+
+        service_name = get_service_name_from_network_mode(ipc_mode)
+        if service_name:
+            return ServiceIpcMode(self.get_service(service_name))
+
+        container_name = get_container_name_from_network_mode(ipc_mode)
+        if container_name:
+            try:
+                return ContainerIpcMode(Container.from_id(self.client, container_name))
+            except APIError:
+                raise ConfigurationError(
+                    "Service '{name}' uses the IPC namespace of container '{dep}' which "
+                    "does not exist.".format(name=service_dict['name'], dep=container_name)
+                )
+
+        return IpcMode(ipc_mode)
+
+    def get_service_scale(self, service_dict):
+        # service.scale for v2 and deploy.replicas for v3
+        scale = service_dict.get('scale', None)
+        deploy_dict = service_dict.get('deploy', None)
+        if not deploy_dict:
+            return 1 if scale is None else scale
+
+        if deploy_dict.get('mode', 'replicated') != 'replicated':
+            return 1 if scale is None else scale
+
+        replicas = deploy_dict.get('replicas', None)
+        if scale is not None and replicas is not None:
+            raise ConfigurationError(
+                "Both service.scale and service.deploy.replicas are set."
+                " Only one of them must be set."
+            )
+        if replicas is not None:
+            scale = replicas
+        if scale is None:
+            return 1
+        # deploy may contain placement constraints introduced in v3.8
+        max_replicas = deploy_dict.get('placement', {}).get(
+            'max_replicas_per_node',
+            scale)
+
+        scale = min(scale, max_replicas)
+        if max_replicas < scale:
+            log.warning("Scale is limited to {} ('max_replicas_per_node' field).".format(
+                max_replicas))
+        return scale
+
+    def get_device_requests(self, service_dict):
+        deploy_dict = service_dict.get('deploy', None)
+        if not deploy_dict:
+            return
+
+        resources = deploy_dict.get('resources', None)
+        if not resources or not resources.get('reservations', None):
+            return
+        devices = resources['reservations'].get('devices')
+        if not devices:
+            return
+
+        for dev in devices:
+            count = dev.get("count", -1)
+            if not isinstance(count, int):
+                if count != "all":
+                    raise ConfigurationError(
+                        'Invalid value "{}" for devices count'.format(dev["count"]),
+                        '(expected integer or "all")')
+                dev["count"] = -1
+
+            if 'capabilities' in dev:
+                dev['capabilities'] = [dev['capabilities']]
+        return devices
 
     def start(self, service_names=None, **options):
         containers = []
@@ -340,10 +462,12 @@ class Project(object):
         self.remove_images(remove_image_type)
 
     def remove_images(self, remove_image_type):
-        for service in self.get_services():
+        for service in self.services:
             service.remove_image(remove_image_type)
 
     def restart(self, service_names=None, **options):
+        # filter service_names by enabled profiles
+        service_names = [s.name for s in self.get_services(service_names)]
         containers = self.containers(service_names, stopped=True)
 
         parallel.parallel_execute(
@@ -355,17 +479,26 @@ class Project(object):
         return containers
 
     def build(self, service_names=None, no_cache=False, pull=False, force_rm=False, memory=None,
-              build_args=None, gzip=False, parallel_build=False):
+              build_args=None, gzip=False, parallel_build=False, rm=True, silent=False, cli=False,
+              progress=None):
 
         services = []
         for service in self.get_services(service_names):
             if service.can_be_built():
                 services.append(service)
-            else:
+            elif not silent:
                 log.info('%s uses an image, skipping' % service.name)
 
+        if cli:
+            if parallel_build:
+                log.warning("Flag '--parallel' is ignored when building with "
+                            "COMPOSE_DOCKER_CLI_BUILD=1")
+            if gzip:
+                log.warning("Flag '--compress' is ignored when building with "
+                            "COMPOSE_DOCKER_CLI_BUILD=1")
+
         def build_service(service):
-            service.build(no_cache, pull, force_rm, memory, build_args, gzip)
+            service.build(no_cache, pull, force_rm, memory, build_args, gzip, rm, silent, cli, progress)
 
         if parallel_build:
             _, errors = parallel.parallel_execute(
@@ -377,7 +510,7 @@ class Project(object):
             )
             if len(errors):
                 combined_errors = '\n'.join([
-                    e.decode('utf-8') if isinstance(e, six.binary_type) else e for e in errors.values()
+                    e.decode('utf-8') if isinstance(e, bytes) else e for e in errors.values()
                 ])
                 raise ProjectError(combined_errors)
 
@@ -469,10 +602,10 @@ class Project(object):
                 'action': event['status'],
                 'id': event['Actor']['ID'],
                 'service': container_attrs.get(LABEL_SERVICE),
-                'attributes': dict([
-                    (k, v) for k, v in container_attrs.items()
+                'attributes': {
+                    k: v for k, v in container_attrs.items()
                     if not k.startswith('com.docker.compose.')
-                ]),
+                },
                 'container': container,
             }
 
@@ -510,6 +643,10 @@ class Project(object):
            reset_container_image=False,
            renew_anonymous_volumes=False,
            silent=False,
+           cli=False,
+           one_off=False,
+           attach_dependencies=False,
+           override_options=None,
            ):
 
         self.initialize()
@@ -524,21 +661,31 @@ class Project(object):
             include_deps=start_deps)
 
         for svc in services:
-            svc.ensure_image_exists(do_build=do_build, silent=silent)
+            svc.ensure_image_exists(do_build=do_build, silent=silent, cli=cli)
         plans = self._get_convergence_plans(
-            services, strategy, always_recreate_deps=always_recreate_deps)
+            services,
+            strategy,
+            always_recreate_deps=always_recreate_deps,
+            one_off=service_names if one_off else [],
+        )
+
+        services_to_attach = filter_attached_for_up(
+            services,
+            service_names,
+            attach_dependencies,
+            lambda service: service.name)
 
         def do(service):
-
             return service.execute_convergence_plan(
                 plans[service.name],
                 timeout=timeout,
-                detached=detached,
+                detached=detached or (service not in services_to_attach),
                 scale_override=scale_override.get(service.name),
                 rescale=rescale,
                 start=start,
                 reset_container_image=reset_container_image,
                 renew_anonymous_volumes=renew_anonymous_volumes,
+                override_options=override_options,
             )
 
         def get_deps(service):
@@ -570,7 +717,7 @@ class Project(object):
         self.networks.initialize()
         self.volumes.initialize()
 
-    def _get_convergence_plans(self, services, strategy, always_recreate_deps=False):
+    def _get_convergence_plans(self, services, strategy, always_recreate_deps=False, one_off=None):
         plans = {}
 
         for service in services:
@@ -580,6 +727,7 @@ class Project(object):
                 if name in plans and
                 plans[name].action in ('recreate', 'create')
             ]
+            is_one_off = one_off and service.name in one_off
 
             if updated_dependencies and strategy.allows_recreate:
                 log.debug('%s has upstream changes (%s)',
@@ -587,61 +735,87 @@ class Project(object):
                           ", ".join(updated_dependencies))
                 containers_stopped = any(
                     service.containers(stopped=True, filters={'status': ['created', 'exited']}))
-                has_links = any(c.get('HostConfig.Links') for c in service.containers())
-                if always_recreate_deps or containers_stopped or not has_links:
-                    plan = service.convergence_plan(ConvergenceStrategy.always)
+                service_has_links = any(service.get_link_names())
+                container_has_links = any(c.get('HostConfig.Links') for c in service.containers())
+                should_recreate_for_links = service_has_links ^ container_has_links
+                if always_recreate_deps or containers_stopped or should_recreate_for_links:
+                    plan = service.convergence_plan(ConvergenceStrategy.always, is_one_off)
                 else:
-                    plan = service.convergence_plan(strategy)
+                    plan = service.convergence_plan(strategy, is_one_off)
             else:
-                plan = service.convergence_plan(strategy)
+                plan = service.convergence_plan(strategy, is_one_off)
 
             plans[service.name] = plan
 
         return plans
 
-    def pull(self, service_names=None, ignore_pull_failures=False, parallel_pull=False, silent=False,
+    def pull(self, service_names=None, ignore_pull_failures=False, parallel_pull=True, silent=False,
              include_deps=False):
         services = self.get_services(service_names, include_deps)
-        msg = not silent and 'Pulling' or None
 
         if parallel_pull:
-            def pull_service(service):
-                strm = service.pull(ignore_pull_failures, True, stream=True)
-                if strm is None:  # Attempting to pull service with no `image` key is a no-op
-                    return
+            self.parallel_pull(services, silent=silent)
 
-                writer = parallel.get_stream_writer()
+        else:
+            must_build = []
+            for service in services:
+                try:
+                    service.pull(ignore_pull_failures, silent=silent)
+                except (ImageNotFound, NotFound):
+                    if service.can_be_built():
+                        must_build.append(service.name)
+                    else:
+                        raise
 
+            if len(must_build):
+                log.warning('Some service image(s) must be built from source by running:\n'
+                            '    docker-compose build {}'
+                            .format(' '.join(must_build)))
+
+    def parallel_pull(self, services, ignore_pull_failures=False, silent=False):
+        msg = 'Pulling' if not silent else None
+        must_build = []
+
+        def pull_service(service):
+            strm = service.pull(ignore_pull_failures, True, stream=True)
+
+            if strm is None:  # Attempting to pull service with no `image` key is a no-op
+                return
+
+            try:
+                writer = parallel.ParallelStreamWriter.get_instance()
+                if writer is None:
+                    raise RuntimeError('ParallelStreamWriter has not yet been instantiated')
                 for event in strm:
                     if 'status' not in event:
                         continue
-                    status = event['status'].lower()
-                    if 'progressDetail' in event:
-                        detail = event['progressDetail']
-                        if 'current' in detail and 'total' in detail:
-                            percentage = float(detail['current']) / float(detail['total'])
-                            status = '{} ({:.1%})'.format(status, percentage)
-
+                    status = read_status(event)
                     writer.write(
                         msg, service.name, truncate_string(status), lambda s: s
                     )
+            except (ImageNotFound, NotFound):
+                if service.can_be_built():
+                    must_build.append(service.name)
+                else:
+                    raise
 
-            _, errors = parallel.parallel_execute(
-                services,
-                pull_service,
-                operator.attrgetter('name'),
-                msg,
-                limit=5,
-            )
-            if len(errors):
-                combined_errors = '\n'.join([
-                    e.decode('utf-8') if isinstance(e, six.binary_type) else e for e in errors.values()
-                ])
-                raise ProjectError(combined_errors)
+        _, errors = parallel.parallel_execute(
+            services,
+            pull_service,
+            operator.attrgetter('name'),
+            msg,
+            limit=5,
+        )
 
-        else:
-            for service in services:
-                service.pull(ignore_pull_failures, silent=silent)
+        if len(must_build):
+            log.warning('Some service image(s) must be built from source by running:\n'
+                        '    docker-compose build {}'
+                        .format(' '.join(must_build)))
+        if len(errors):
+            combined_errors = '\n'.join([
+                e.decode('utf-8') if isinstance(e, bytes) else e for e in errors.values()
+            ])
+            raise ProjectError(combined_errors)
 
     def push(self, service_names=None, ignore_push_failures=False):
         unique_images = set()
@@ -686,7 +860,7 @@ class Project(object):
 
     def find_orphan_containers(self, remove_orphans):
         def _find():
-            containers = self._labeled_containers()
+            containers = set(self._labeled_containers() + self._labeled_containers(stopped=True))
             for ctnr in containers:
                 service_name = ctnr.labels.get(LABEL_SERVICE)
                 if service_name not in self.service_names:
@@ -696,12 +870,15 @@ class Project(object):
             return
         if remove_orphans:
             for ctnr in orphans:
-                log.info('Removing orphan container "{0}"'.format(ctnr.name))
-                ctnr.kill()
+                log.info('Removing orphan container "{}"'.format(ctnr.name))
+                try:
+                    ctnr.kill()
+                except APIError:
+                    pass
                 ctnr.remove(force=True)
         else:
             log.warning(
-                'Found orphan containers ({0}) for this project. If '
+                'Found orphan containers ({}) for this project. If '
                 'you removed or renamed this service in your compose '
                 'file, you can run this command with the '
                 '--remove-orphans flag to clean it up.'.format(
@@ -709,14 +886,26 @@ class Project(object):
                 )
             )
 
-    def _inject_deps(self, acc, service):
+    def _inject_deps(self, acc, service, enabled_profiles):
         dep_names = service.get_dependency_names()
 
         if len(dep_names) > 0:
             dep_services = self.get_services(
                 service_names=list(set(dep_names)),
-                include_deps=True
+                include_deps=True,
+                auto_enable_profiles=False
             )
+
+            for dep in dep_services:
+                if not dep.enabled_for_profiles(enabled_profiles):
+                    raise ConfigurationError(
+                        'Service "{dep_name}" was pulled in as a dependency of '
+                        'service "{service_name}" but is not enabled by the '
+                        'active profiles. '
+                        'You may fix this by adding a common profile to '
+                        '"{dep_name}" and "{service_name}".'
+                        .format(dep_name=dep.name, service_name=service.name)
+                    )
         else:
             dep_services = []
 
@@ -725,11 +914,87 @@ class Project(object):
 
     def build_container_operation_with_timeout_func(self, operation, options):
         def container_operation_with_timeout(container):
-            if options.get('timeout') is None:
+            _options = options.copy()
+            if _options.get('timeout') is None:
                 service = self.get_service(container.service)
-                options['timeout'] = service.stop_timeout(None)
-            return getattr(container, operation)(**options)
+                _options['timeout'] = service.stop_timeout(None)
+            return getattr(container, operation)(**_options)
         return container_operation_with_timeout
+
+
+def translate_credential_spec_to_security_opt(service_dict):
+    result = []
+
+    if 'credential_spec' in service_dict:
+        spec = convert_credential_spec_to_security_opt(service_dict['credential_spec'])
+        result.append('credentialspec={spec}'.format(spec=spec))
+
+    if result:
+        service_dict['security_opt'] = result
+
+    return service_dict
+
+
+def translate_resource_keys_to_container_config(resources_dict, service_dict):
+    if 'limits' in resources_dict:
+        service_dict['mem_limit'] = resources_dict['limits'].get('memory')
+        if 'cpus' in resources_dict['limits']:
+            service_dict['cpus'] = float(resources_dict['limits']['cpus'])
+    if 'reservations' in resources_dict:
+        service_dict['mem_reservation'] = resources_dict['reservations'].get('memory')
+        if 'cpus' in resources_dict['reservations']:
+            return ['resources.reservations.cpus']
+    return []
+
+
+def convert_restart_policy(name):
+    try:
+        return {
+            'any': 'always',
+            'none': 'no',
+            'on-failure': 'on-failure'
+        }[name]
+    except KeyError:
+        raise ConfigurationError('Invalid restart policy "{}"'.format(name))
+
+
+def convert_credential_spec_to_security_opt(credential_spec):
+    if 'file' in credential_spec:
+        return 'file://{file}'.format(file=credential_spec['file'])
+    return 'registry://{registry}'.format(registry=credential_spec['registry'])
+
+
+def translate_deploy_keys_to_container_config(service_dict):
+    if 'credential_spec' in service_dict:
+        del service_dict['credential_spec']
+    if 'configs' in service_dict:
+        del service_dict['configs']
+
+    if 'deploy' not in service_dict:
+        return service_dict, []
+
+    deploy_dict = service_dict['deploy']
+    ignored_keys = [
+        k for k in ['endpoint_mode', 'labels', 'update_config', 'rollback_config']
+        if k in deploy_dict
+    ]
+
+    if 'restart_policy' in deploy_dict:
+        service_dict['restart'] = {
+            'Name': convert_restart_policy(deploy_dict['restart_policy'].get('condition', 'any')),
+            'MaximumRetryCount': deploy_dict['restart_policy'].get('max_attempts', 0)
+        }
+        for k in deploy_dict['restart_policy'].keys():
+            if k != 'condition' and k != 'max_attempts':
+                ignored_keys.append('restart_policy.{}'.format(k))
+
+    ignored_keys.extend(
+        translate_resource_keys_to_container_config(
+            deploy_dict.get('resources', {}), service_dict
+        )
+    )
+    del service_dict['deploy']
+    return service_dict, ignored_keys
 
 
 def get_volumes_from(project, service_dict):
@@ -771,28 +1036,121 @@ def get_secrets(service, service_secrets, secret_defs):
                 .format(service=service, secret=secret.source))
 
         if secret_def.get('external'):
-            log.warn("Service \"{service}\" uses secret \"{secret}\" which is external. "
-                     "External secrets are not available to containers created by "
-                     "docker-compose.".format(service=service, secret=secret.source))
+            log.warning('Service "{service}" uses secret "{secret}" which is external. '
+                        'External secrets are not available to containers created by '
+                        'docker-compose.'.format(service=service, secret=secret.source))
             continue
 
         if secret.uid or secret.gid or secret.mode:
-            log.warn(
-                "Service \"{service}\" uses secret \"{secret}\" with uid, "
-                "gid, or mode. These fields are not supported by this "
-                "implementation of the Compose file".format(
+            log.warning(
+                'Service "{service}" uses secret "{secret}" with uid, '
+                'gid, or mode. These fields are not supported by this '
+                'implementation of the Compose file'.format(
                     service=service, secret=secret.source
                 )
             )
 
-        secrets.append({'secret': secret, 'file': secret_def.get('file')})
+        secret_file = secret_def.get('file')
+        if not path.isfile(str(secret_file)):
+            log.warning(
+                'Service "{service}" uses an undefined secret file "{secret_file}", '
+                'the following file should be created "{secret_file}"'.format(
+                    service=service, secret_file=secret_file
+                )
+            )
+        secrets.append({'secret': secret, 'file': secret_file})
 
     return secrets
 
 
+def get_image_digests(project):
+    digests = {}
+    needs_push = set()
+    needs_pull = set()
+
+    for service in project.services:
+        try:
+            digests[service.name] = get_image_digest(service)
+        except NeedsPush as e:
+            needs_push.add(e.image_name)
+        except NeedsPull as e:
+            needs_pull.add(e.service_name)
+
+    if needs_push or needs_pull:
+        raise MissingDigests(needs_push, needs_pull)
+
+    return digests
+
+
+def get_image_digest(service):
+    if 'image' not in service.options:
+        raise UserError(
+            "Service '{s.name}' doesn't define an image tag. An image name is "
+            "required to generate a proper image digest. Specify an image repo "
+            "and tag with the 'image' option.".format(s=service))
+
+    _, _, separator = parse_repository_tag(service.options['image'])
+    # Compose file already uses a digest, no lookup required
+    if separator == '@':
+        return service.options['image']
+
+    digest = get_digest(service)
+
+    if digest:
+        return digest
+
+    if 'build' not in service.options:
+        raise NeedsPull(service.image_name, service.name)
+
+    raise NeedsPush(service.image_name)
+
+
+def get_digest(service):
+    digest = None
+    try:
+        image = service.image()
+        # TODO: pick a digest based on the image tag if there are multiple
+        # digests
+        if image['RepoDigests']:
+            digest = image['RepoDigests'][0]
+    except NoSuchImageError:
+        try:
+            # Fetch the image digest from the registry
+            distribution = service.get_image_registry_data()
+
+            if distribution['Descriptor']['digest']:
+                digest = '{image_name}@{digest}'.format(
+                    image_name=service.image_name,
+                    digest=distribution['Descriptor']['digest']
+                )
+        except NoSuchImageError:
+            raise UserError(
+                "Digest not found for service '{service}'. "
+                "Repository does not exist or may require 'docker login'"
+                .format(service=service.name))
+    return digest
+
+
+class MissingDigests(Exception):
+    def __init__(self, needs_push, needs_pull):
+        self.needs_push = needs_push
+        self.needs_pull = needs_pull
+
+
+class NeedsPush(Exception):
+    def __init__(self, image_name):
+        self.image_name = image_name
+
+
+class NeedsPull(Exception):
+    def __init__(self, image_name, service_name):
+        self.image_name = image_name
+        self.service_name = service_name
+
+
 class NoSuchService(Exception):
     def __init__(self, name):
-        if isinstance(name, six.binary_type):
+        if isinstance(name, bytes):
             name = name.decode('utf-8')
         self.name = name
         self.msg = "No such service: %s" % self.name
